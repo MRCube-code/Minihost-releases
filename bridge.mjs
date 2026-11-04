@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { spawn, execSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -16,8 +15,21 @@ const SERVER_PROPERTIES_PATH = path.join(PAPER_DIR, "server.properties");
 const EULA_PATH        = path.join(PAPER_DIR, "eula.txt");
 const PAPER_JAR_PATH   = path.join(PAPER_DIR, "paper.jar");
 const GEYSER_JAR_PATH  = path.join(PLUGINS_DIR, "Geyser-Spigot.jar");
-const VIAVERSION_JAR_PATH  = path.join(PLUGINS_DIR, "ViaVersion-5.9.1.jar");
-const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards-5.9.1.jar");
+// BEFORE: filenames pinned the jar to a specific ViaVersion/ViaBackwards release
+//         (ViaVersion-5.9.1.jar), so the download URL had to be bumped by hand every time
+//         upstream shipped a new build — and it wasn't: 5.9.1 predates ViaVersion 5.10.0's
+//         "Added 26.2 client support" release (confirmed via Hangar changelog), meaning the
+//         pinned jar silently couldn't bridge current Minecraft clients at all.
+// AFTER: fixed local filenames, resolved dynamically to whatever GitHub's "latest release"
+//        actually is at install time (see getLatestGithubAsset/ensureViaJars below) — same
+//        "download once, keep using the local file" pattern Geyser already uses above.
+const VIAVERSION_JAR_PATH   = path.join(PLUGINS_DIR, "ViaVersion.jar");
+const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards.jar");
+// Floodgate lets Bedrock players join without a linked Java/Microsoft account. Opt-in (see
+// state.settings.bedrockAuth) — the long-standing default is auth-type: offline, and flipping
+// a running server to Floodgate changes Bedrock players' UUIDs, which can orphan their
+// existing inventories/playerdata. Default stays "offline" so nobody is switched without asking.
+const FLOODGATE_JAR_PATH = path.join(PLUGINS_DIR, "floodgate-spigot.jar");
 
 // Playit — proot-Debian approach.
 // BEFORE: downloaded a native ARM64 binary and ran it directly in Termux.
@@ -27,6 +39,10 @@ const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards-5.9.1.jar");
 //        runs correctly inside a proot-distro Debian container. Every command and log line
 //        referenced below was run/observed on a real device before being written here.
 const PLAYIT_DIR          = path.join(POCKETHOST_DIR, "playit");
+// World backups — see backupWorld()/backupAllWorlds() below. Mirrors Aternos' "automatic
+// backup on stop" and Minehut's "manual backup from dashboard" features — Pocket Host had
+// no backup of any kind before this (worlds could only be deleted).
+const BACKUPS_DIR         = path.join(POCKETHOST_DIR, "backups");
 const PLAYIT_TUNNELS_FILE = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
 const PLAYIT_SECRET_FILE  = path.join(PLAYIT_DIR, "secret.key");      // playit.gg agent secret, pasted by the user once
 const DEBIAN_DISTRO       = "debian";
@@ -38,8 +54,9 @@ const DEBIAN_DISTRO       = "debian";
 //   `playit setup` in a second session while the daemon is running.
 
 const GEYSER_URL       = "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot";
-const VIAVERSION_URL   = "https://github.com/ViaVersion/ViaVersion/releases/download/5.9.1/ViaVersion-5.9.1.jar";
-const VIABACKWARDS_URL = "https://github.com/ViaVersion/ViaBackwards/releases/download/5.9.1/ViaBackwards-5.9.1.jar";
+// Floodgate ships from the same GeyserMC download server as Geyser itself, same "spigot"
+// platform (confirmed: download.geysermc.org/v2/projects/floodgate exists with a spigot build).
+const FLOODGATE_URL    = "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot";
 // BEFORE: "https://api.papermc.io/v2/projects/paper" — PaperMC's v2 downloads API was
 //         deprecated Dec 31, 2025 and fully shut off July 1, 2026, returning HTTP 410 Gone.
 // AFTER: PaperMC's replacement is the "Fill" API (confirmed at docs.papermc.io/misc/downloads-service/).
@@ -126,6 +143,11 @@ const state = {
     motd: "Powered by PocketHost", onlineMode: false, viewDistance: 8,
     pvp: true, allowFlight: false, whiteList: false,
     mode: null, // 'java' | 'java_bedrock' — null means not yet chosen; set by loadServerMode()
+    // 'offline' (default, matches every server shipped before this field existed) lets Bedrock
+    // players join without a linked Xbox account; 'floodgate' gives each Bedrock player their
+    // own Floodgate identity instead. Opt-in only — see setBedrockAuth(). Persisted alongside
+    // `mode` in MODE_FILE so the choice survives a bridge restart.
+    bedrockAuth: "offline", // 'offline' | 'floodgate'
   },
   worlds: [],
   packs: [],
@@ -216,6 +238,65 @@ function compareVersions(a, b) {
   return 0;
 }
 
+// Resolves a GitHub repo's latest release asset whose filename matches `assetPattern`, via the
+// repos/{owner}/{repo}/releases/latest API. Reuses wgetJson, which already sends a required
+// User-Agent header on every request — GitHub's API rejects anonymous/UA-less requests the
+// same way PaperMC's Fill API does, so the existing helper works here unchanged.
+async function getLatestGithubAsset(owner, repo, assetPattern) {
+  const release = await wgetJson(`https://api.github.com/repos/${owner}/${repo}/releases/latest`);
+  const asset = (release.assets || []).find(a => assetPattern.test(a.name));
+  if (!asset) throw new Error(`No matching asset in ${owner}/${repo}'s latest release (${release.tag_name || "unknown tag"})`);
+  return { tag: release.tag_name, url: asset.browser_download_url, name: asset.name };
+}
+
+// Downloads ViaVersion/ViaBackwards if the local jar is missing, resolving "latest" from
+// GitHub releases instead of a hardcoded version/URL (see VIAVERSION_JAR_PATH comment above).
+// Mirrors Geyser's existing "only fetch if not already on disk" pattern — there's no periodic
+// re-check, same as Geyser; removeOldViaJars() clears out any previous versioned filename
+// first so an existing install picks up the dynamic-latest jar on its next install/mode-switch.
+async function ensureViaJars() {
+  await removeOldViaJars();
+  if (!(await exists(VIAVERSION_JAR_PATH))) {
+    log("[Bridge] Finding latest ViaVersion release...");
+    const via = await getLatestGithubAsset("ViaVersion", "ViaVersion", /^ViaVersion-.*\.jar$/);
+    log(`[Bridge] Downloading ViaVersion ${via.tag}...`);
+    await wget(via.url, VIAVERSION_JAR_PATH);
+    log(`[Bridge] ViaVersion ${via.tag} ready`);
+  }
+  if (!(await exists(VIABACKWARDS_JAR_PATH))) {
+    log("[Bridge] Finding latest ViaBackwards release...");
+    const vb = await getLatestGithubAsset("ViaVersion", "ViaBackwards", /^ViaBackwards-.*\.jar$/);
+    log(`[Bridge] Downloading ViaBackwards ${vb.tag}...`);
+    await wget(vb.url, VIABACKWARDS_JAR_PATH);
+    log(`[Bridge] ViaBackwards ${vb.tag} ready`);
+  }
+}
+
+// Downloads Floodgate if the local jar is missing. Only called when bedrockAuth === 'floodgate'
+// (opt-in — see state.settings.bedrockAuth).
+async function ensureFloodgateJar() {
+  if (!(await exists(FLOODGATE_JAR_PATH))) {
+    log("[Bridge] Downloading Floodgate (lets Bedrock players join without a linked Xbox account)...");
+    await wget(FLOODGATE_URL, FLOODGATE_JAR_PATH);
+    log("[Bridge] Floodgate ready");
+  }
+}
+
+// Total physical RAM Termux can see on this device, read from /proc/meminfo (the same file
+// the stats poller already reads for live ramUsedMb). Lets the Settings screen build a RAM
+// slider in whole-GB steps scaled to what THIS phone actually has, instead of a fixed MB range
+// nobody can mentally convert.
+async function getSystemRam() {
+  try {
+    const mem = await fs.readFile("/proc/meminfo", "utf8");
+    const totalKb = parseInt(mem.match(/MemTotal:\s+(\d+)/)?.[1] || "0", 10);
+    return { totalRamMb: Math.round(totalKb / 1024) };
+  } catch (err) {
+    log(`[Bridge] Failed to read /proc/meminfo: ${err.message}`);
+    return { totalRamMb: 0 };
+  }
+}
+
 function runCmd(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
@@ -230,7 +311,7 @@ function runCmd(cmd, args, opts = {}) {
 async function exists(p) { try { await fs.access(p); return true; } catch { return false; } }
 
 async function ensureDirs() {
-  for (const d of [POCKETHOST_DIR, PAPER_DIR, PLUGINS_DIR, RES_PACKS_DIR, PLAYIT_DIR])
+  for (const d of [POCKETHOST_DIR, PAPER_DIR, PLUGINS_DIR, RES_PACKS_DIR, PLAYIT_DIR, BACKUPS_DIR])
     await fs.mkdir(d, { recursive: true });
 }
 
@@ -241,6 +322,12 @@ async function ensureDirs() {
 async function loadServerMode() {
   try {
     const data = JSON.parse(await fs.readFile(MODE_FILE, "utf8"));
+    // BEFORE: only `mode` was persisted — bedrockAuth silently reset to "offline" on every
+    //         bridge restart, which would quietly undo a user's Floodgate opt-in.
+    // AFTER: bedrockAuth is read back too; absent in an older/pre-existing MODE_FILE just
+    //        means "offline" (the default already set in state.settings), so this is backward
+    //        compatible with every MODE_FILE written before this field existed.
+    if (data.bedrockAuth === "floodgate") state.settings.bedrockAuth = "floodgate";
     if (data.mode === "java" || data.mode === "java_bedrock") { state.settings.mode = data.mode; return; }
   } catch {}
   if (await exists(GEYSER_JAR_PATH)) {
@@ -253,7 +340,7 @@ async function loadServerMode() {
 
 async function saveServerMode(mode) {
   await fs.mkdir(POCKETHOST_DIR, { recursive: true });
-  await fs.writeFile(MODE_FILE, JSON.stringify({ mode }));
+  await fs.writeFile(MODE_FILE, JSON.stringify({ mode, bedrockAuth: state.settings.bedrockAuth || "offline" }));
 }
 
 async function setupPhAlias() {
@@ -695,7 +782,9 @@ async function writeGeyserConfig(force = false) {
     `  motd2: "${state.settings.motd || "Powered by PocketHost"}"`,
     `  server-name: "${state.settings.serverName || "PocketHost"}"`,
     `remote:`, `  address: 127.0.0.1`,
-    `  port: ${state.settings.port}`, `  auth-type: offline`,
+    // BEFORE: hardcoded "offline" — Floodgate could never actually be used even once added.
+    // AFTER: reads the opt-in toggle; still defaults to "offline" for every existing server.
+    `  port: ${state.settings.port}`, `  auth-type: ${state.settings.bedrockAuth === "floodgate" ? "floodgate" : "offline"}`,
     `metrics:`, `  enabled: false`, `  uuid: 00000000-0000-0000-0000-000000000000`,
   ].join("\n") + "\n";
   await fs.writeFile(cfg, config);
@@ -714,11 +803,18 @@ async function initServerProperties() {
   await fs.writeFile(SERVER_PROPERTIES_PATH, lines.join("\n") + "\n");
 }
 
+// BEFORE: kept the specific "ViaVersion-5.9.1.jar"/"ViaBackwards-5.9.1.jar" pinned filenames,
+//         deleting any other (newer) jar an admin might have dropped in.
+// AFTER: the jar filenames are no longer version-pinned (see VIAVERSION_JAR_PATH comment) —
+//        this now only clears out *old-style* versioned filenames from installs that predate
+//        that change, so ensureViaJars() redownloads once under the new fixed name. It leaves
+//        the current fixed-name jars (ViaVersion.jar/ViaBackwards.jar) alone so an already
+//        up-to-date install doesn't get wiped and re-fetched on every call.
 async function removeOldViaJars() {
   const entries = await fs.readdir(PLUGINS_DIR).catch(() => []);
   for (const f of entries) {
-    if (f.startsWith("ViaVersion") || f.startsWith("ViaBackwards")) {
-      if (f === "ViaVersion-5.9.1.jar" || f === "ViaBackwards-5.9.1.jar") continue;
+    if (f === "ViaVersion.jar" || f === "ViaBackwards.jar") continue;
+    if (/^ViaVersion-.*\.jar$/.test(f) || /^ViaBackwards-.*\.jar$/.test(f)) {
       await fs.rm(path.join(PLUGINS_DIR, f), { force: true, recursive: true });
       log(`[Bridge] Removed old Via: ${f}`);
     }
@@ -784,17 +880,10 @@ async function installPaper() {
       await wget(GEYSER_URL, GEYSER_JAR_PATH);
       log("[Bridge] Geyser-Spigot ready");
     }
-    await removeOldViaJars();
-    if (!(await exists(VIAVERSION_JAR_PATH))) {
-      log("[Bridge] Downloading ViaVersion 5.9.1...");
-      await wget(VIAVERSION_URL, VIAVERSION_JAR_PATH);
-      log("[Bridge] ViaVersion 5.9.1 ready");
-    }
-    if (!(await exists(VIABACKWARDS_JAR_PATH))) {
-      log("[Bridge] Downloading ViaBackwards 5.9.1...");
-      await wget(VIABACKWARDS_URL, VIABACKWARDS_JAR_PATH);
-      log("[Bridge] ViaBackwards 5.9.1 ready");
-    }
+    // BEFORE: downloaded ViaVersion/ViaBackwards pinned to the hardcoded 5.9.1 URLs inline here.
+    // AFTER: ensureViaJars() resolves "latest" from GitHub releases — see its own comment.
+    await ensureViaJars();
+    if (state.settings.bedrockAuth === "floodgate") await ensureFloodgateJar();
     await writeGeyserConfig();
   } else {
     log("[Bridge] Java-only mode — skipping Geyser/Bedrock download");
@@ -833,6 +922,135 @@ async function getWorlds() {
   }
   state.worlds = worlds;
   return worlds;
+}
+
+// ─── World backups ────────────────────────────────────────────────────────────
+// Aternos auto-backs-up to Google Drive on every server stop; Minehut offers manual backups
+// from its dashboard. Pocket Host had neither — worlds could only be deleted. This adds
+// local .tar.gz backups (device storage, no cloud account needed) with the same two modes:
+// automatic (before anything that touches the world — a version/mode switch) and manual
+// (a Backup button in the Worlds tab).
+
+// Installs `tar` via Termux's pkg manager if missing — same pattern as ensureJavaAtLeast()
+// above (check via `which`, install via pkg, re-verify). Not previously confirmed on a real
+// device the way ensureJavaAtLeast's openjdk packages were, so it's written defensively:
+// checked before every use, never assumed present.
+let hasTar = null;
+async function ensureTar() {
+  if (hasTar) return true;
+  try { execSync("which tar", { stdio: "ignore" }); hasTar = true; return true; } catch {}
+  log("[Bridge] tar not found — installing via pkg...");
+  try {
+    await runCmd("pkg", ["install", "-y", "tar"]);
+    execSync("which tar", { stdio: "ignore" });
+    hasTar = true;
+    return true;
+  } catch (err) {
+    log(`[Bridge] Could not install tar: ${err.message}`);
+    return false;
+  }
+}
+
+// Keep only the newest N backups per world folder so auto-backups (triggered on every
+// version/mode switch) don't quietly fill up the device's storage over time.
+const MAX_BACKUPS_PER_WORLD = 5;
+
+function parseBackupFilename(f) {
+  // Format: <folder>__<ISO-with-colons-as-dashes>.tar.gz — colons are stripped because
+  // some Android/Termux storage backends don't allow them in filenames.
+  const m = f.match(/^(.+)__(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.tar\.gz$/);
+  if (!m) return null;
+  return { folder: m[1], isoSafe: m[2], createdIso: m[2].replace(/T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, "T$1:$2:$3.$4Z") };
+}
+
+async function getBackups() {
+  await ensureDirs();
+  const entries = await fs.readdir(BACKUPS_DIR).catch(() => []);
+  const backups = [];
+  for (const f of entries) {
+    const parsed = parseBackupFilename(f);
+    if (!parsed) continue;
+    let sizeMb = 0;
+    try {
+      const st = await fs.stat(path.join(BACKUPS_DIR, f));
+      sizeMb = Math.max(1, Math.round(st.size / (1024 * 1024)));
+    } catch {}
+    backups.push({ id: f, folder: parsed.folder, createdIso: parsed.createdIso, sizeMb });
+  }
+  backups.sort((a, b) => b.createdIso.localeCompare(a.createdIso));
+  return backups;
+}
+
+// Backs up a single world folder to BACKUPS_DIR, pruning older backups of the same folder
+// beyond MAX_BACKUPS_PER_WORLD. Safe to call while the server is stopped or running (tar
+// reading a live world directory can occasionally miss an in-flight write, same tradeoff
+// Aternos'/Minehut's own "backup without stopping" options make — this isn't attempting
+// anything smarter like a filesystem snapshot, since Termux has no such primitive available).
+async function backupWorld(folder) {
+  if (!(await ensureTar())) throw new Error("tar is not available and could not be installed");
+  const worldPath = path.join(PAPER_DIR, folder);
+  if (!(await exists(worldPath))) throw new Error(`World folder not found: ${folder}`);
+
+  const isoSafe = new Date().toISOString().replace(/:/g, "-").replace(/\.(\d{3})Z$/, "-$1Z");
+  const filename = `${folder}__${isoSafe}.tar.gz`;
+  await fs.mkdir(BACKUPS_DIR, { recursive: true });
+  log(`[Bridge] Backing up world '${folder}'...`);
+  await runCmd("tar", ["-czf", path.join(BACKUPS_DIR, filename), "-C", PAPER_DIR, folder]);
+  log(`[Bridge] Backup saved: ${filename}`);
+
+  // Prune older backups of this same folder beyond the cap.
+  const all = (await getBackups()).filter(b => b.folder === folder);
+  for (const old of all.slice(MAX_BACKUPS_PER_WORLD)) {
+    await fs.rm(path.join(BACKUPS_DIR, old.id), { force: true }).catch(() => {});
+    log(`[Bridge] Pruned old backup: ${old.id}`);
+  }
+  return { id: filename, folder, createdIso: new Date().toISOString() };
+}
+
+// Backs up every world folder currently on disk. Called automatically before a Paper
+// version switch or a Java/Bedrock mode switch (both of which stop the server and touch
+// the install) — wrapped in try/catch by callers so a backup failure never blocks the
+// operation the user actually asked for, only gets logged.
+async function backupAllWorlds() {
+  const worlds = await getWorlds();
+  const results = [];
+  for (const w of worlds) {
+    try { results.push(await backupWorld(w.folder)); }
+    catch (err) { log(`[Bridge] Backup of '${w.folder}' failed (continuing): ${err.message}`); }
+  }
+  return results;
+}
+
+async function restoreBackup(backupId) {
+  const parsed = parseBackupFilename(backupId);
+  if (!parsed) throw new Error("Invalid backup id");
+  const archivePath = path.join(BACKUPS_DIR, backupId);
+  if (!(await exists(archivePath))) throw new Error("Backup not found");
+  if (!(await ensureTar())) throw new Error("tar is not available and could not be installed");
+
+  if (serverProcess) {
+    log("[Bridge] Stopping server before restoring backup...");
+    await stopServer();
+  }
+
+  const worldPath = path.join(PAPER_DIR, parsed.folder);
+  log(`[Bridge] Restoring '${parsed.folder}' from ${backupId}...`);
+  // Replace the existing folder outright rather than merging, so a restore can't leave a mix
+  // of old and backed-up chunk files behind.
+  await fs.rm(worldPath, { recursive: true, force: true });
+  await runCmd("tar", ["-xzf", archivePath, "-C", PAPER_DIR]);
+  log(`[Bridge] Restore complete: '${parsed.folder}'`);
+
+  await getWorlds();
+  broadcast("worlds.update", { worlds: state.worlds });
+  return { restored: parsed.folder };
+}
+
+async function deleteBackup(backupId) {
+  if (!parseBackupFilename(backupId)) throw new Error("Invalid backup id");
+  await fs.rm(path.join(BACKUPS_DIR, backupId), { force: true });
+  log(`[Bridge] Backup deleted: ${backupId}`);
+  return { deleted: backupId };
 }
 
 async function getPacks() {
@@ -887,6 +1105,57 @@ async function pluginDelete(name) {
   await fs.rm(path.join(PLUGINS_DIR, filename), { force: true, recursive: true });
   log(`[Bridge] Plugin deleted: ${filename}`);
   return { deleted: filename };
+}
+
+// ─── Modrinth plugin/mod browser ───────────────────────────────────────────────
+// Both Aternos and Minehut let you search and one-tap install plugins/mods from a library
+// instead of needing a direct .jar URL (which was previously the only way to install one
+// here). Modrinth's public API is used — confirmed live and working against the real
+// endpoints below, not guessed: GET https://api.modrinth.com/v2/search (facets filter by
+// project_type), and GET https://api.modrinth.com/v2/project/{slug}/version (loaders filter,
+// each version's files[] has a `primary` flag and a direct `url`). Modrinth's docs require a
+// uniquely-identifying User-Agent on every request — wgetJson already sends PAPER_USER_AGENT
+// on every call, so no changes needed there.
+const MODRINTH_API = "https://api.modrinth.com/v2";
+
+// `projectType` is "plugin" or "mod" — both are real Modrinth search facets, confirmed live:
+// project_type:plugin returns real Bukkit/Paper/Spigot plugins (its displayed project_type
+// field is internally "mod" either way — a Modrinth quirk — but the facet itself works).
+async function pluginSearch(query, projectType) {
+  const type = projectType === "mod" ? "mod" : "plugin";
+  const facets = encodeURIComponent(JSON.stringify([[`project_type:${type}`]]));
+  const q = encodeURIComponent(query || "");
+  const data = await wgetJson(`${MODRINTH_API}/search?query=${q}&facets=${facets}&limit=20&index=relevance`);
+  return (data.hits || []).map(h => ({
+    id:          h.project_id,
+    slug:        h.slug || h.project_id,
+    title:       h.title,
+    description: h.description || "",
+    iconUrl:     h.icon_url || "",
+    downloads:   h.downloads || 0,
+  }));
+}
+
+// Resolves a Modrinth project slug to a concrete downloadable file compatible with this
+// server (Paper, which also serves Spigot/Bukkit plugins; Fabric for mods). Modrinth
+// returns versions newest-first, so the first one with a usable file wins.
+async function modrinthResolveDownload(slug, projectType) {
+  const loaders = projectType === "mod" ? ["fabric"] : ["paper", "spigot", "bukkit"];
+  const loadersParam = encodeURIComponent(JSON.stringify(loaders));
+  const versions = await wgetJson(`${MODRINTH_API}/project/${encodeURIComponent(slug)}/version?loaders=${loadersParam}`);
+  if (!Array.isArray(versions) || !versions.length) {
+    throw new Error("No version of this plugin/mod is compatible with this server");
+  }
+  for (const v of versions) {
+    const file = (v.files || []).find(f => f.primary) || v.files?.[0];
+    if (file && file.url && file.filename) return { url: file.url, filename: file.filename };
+  }
+  throw new Error("No downloadable file found for this plugin/mod");
+}
+
+async function pluginInstallFromModrinth(slug, projectType) {
+  const { url, filename } = await modrinthResolveDownload(slug, projectType);
+  return pluginInstall(url, filename);
 }
 
 // ─── File management ──────────────────────────────────────────────────────────
@@ -948,6 +1217,11 @@ async function switchPaperVersion(mcVersion) {
     log("[Bridge] Stopping server before version switch...");
     await stopServer();   // full graceful stop: sends "stop", waits 30 s max
   }
+  // A version switch doesn't touch world files directly, but it's exactly the kind of
+  // operation where a bad Paper build or a plugin incompatibility could still corrupt data
+  // on next start — so back up first, same as Aternos does before anything risky. Never
+  // blocks the switch itself; backupAllWorlds() already swallows per-world failures.
+  await backupAllWorlds().catch(err => log(`[Bridge] Pre-switch backup failed (continuing): ${err.message}`));
   let result = await tryGetStablePaperBuild(mcVersion);
   if (!result) {
     log(`[Bridge] ${mcVersion} has no stable build — finding the closest version that does...`);
@@ -956,7 +1230,39 @@ async function switchPaperVersion(mcVersion) {
   await fs.rm(PAPER_JAR_PATH, { force: true });
   await wget(result.url, PAPER_JAR_PATH, ["--header", `User-Agent: ${PAPER_USER_AGENT}`]);
   log(`[Bridge] Switched to Paper ${result.version} build ${result.build}`);
-  return { switched: result.version };
+
+  // BEFORE: switching Paper versions never touched Geyser/ViaVersion/ViaBackwards/Floodgate at
+  //         all — an upgrade or downgrade could leave Bedrock support stale or (after a fresh
+  //         install elsewhere) entirely missing even though java_bedrock mode was already on.
+  // AFTER: re-verifies all Bedrock-support jars after every version switch. Geyser itself
+  //        always emulates the newest Java client protocol (it isn't per-MC-version — confirmed
+  //        via GeyserMC/ViaVersion docs), so what actually needs re-syncing on a Java version
+  //        change is ViaVersion/ViaBackwards (the protocol bridge to the backend you just
+  //        switched to) and Floodgate if the user opted into it; ensureGeyser below is just a
+  //        safety net in case the jar was removed out from under the bridge.
+  let bedrockResynced = false;
+  if (state.settings.mode === "java_bedrock") {
+    if (!(await exists(GEYSER_JAR_PATH))) {
+      log("[Bridge] Re-downloading Geyser-Spigot after version switch...");
+      await wget(GEYSER_URL, GEYSER_JAR_PATH);
+    }
+    await ensureViaJars();
+    if (state.settings.bedrockAuth === "floodgate") await ensureFloodgateJar();
+    await writeGeyserConfig(true);
+    bedrockResynced = true;
+    log("[Bridge] Bedrock support (Geyser/ViaVersion/ViaBackwards" + (state.settings.bedrockAuth === "floodgate" ? "/Floodgate" : "") + ") re-synced for the new version");
+  }
+
+  // BEFORE: the frontend had no way to know the requested version wasn't what it got — the
+  //         fallback was only ever written to the log.
+  // AFTER: `requested` + `fellBack` let version.tsx show "switched to X instead of Y" instead
+  //        of silently claiming success for a version that was never actually installed.
+  return {
+    switched:      result.version,
+    requested:     mcVersion,
+    fellBack:      result.version !== mcVersion,
+    bedrockResynced,
+  };
 }
 
 async function updateServerProperties(s) {
@@ -1242,6 +1548,10 @@ async function setServerMode(mode) {
     await stopServer();
   }
 
+  // Same reasoning as switchPaperVersion(): mode switches add/remove plugin jars that affect
+  // how the world loads next start, so back up first. Never blocks the switch.
+  await backupAllWorlds().catch(err => log(`[Bridge] Pre-switch backup failed (continuing): ${err.message}`));
+
   // Set immediately — before downloads — so a concurrent startServer() call (which checks
   // this same field in installPaper()) never reads a stale value while jars are still downloading.
   state.settings.mode = mode;
@@ -1250,21 +1560,52 @@ async function setServerMode(mode) {
   await fs.mkdir(PLUGINS_DIR, { recursive: true });
 
   if (nowBedrock) {
-    log("[Bridge] Enabling Bedrock support — downloading Geyser + ViaVersion...");
-    if (!(await exists(GEYSER_JAR_PATH)))       await wget(GEYSER_URL, GEYSER_JAR_PATH);
-    await removeOldViaJars();
-    if (!(await exists(VIAVERSION_JAR_PATH)))   await wget(VIAVERSION_URL, VIAVERSION_JAR_PATH);
-    if (!(await exists(VIABACKWARDS_JAR_PATH))) await wget(VIABACKWARDS_URL, VIABACKWARDS_JAR_PATH);
+    log("[Bridge] Enabling Bedrock support — downloading Geyser + ViaVersion/ViaBackwards...");
+    if (!(await exists(GEYSER_JAR_PATH))) await wget(GEYSER_URL, GEYSER_JAR_PATH);
+    await ensureViaJars();
+    if (state.settings.bedrockAuth === "floodgate") await ensureFloodgateJar();
     await writeGeyserConfig(true);
     log("[Bridge] Bedrock support ready — start the server to activate");
   } else {
-    log("[Bridge] Disabling Bedrock support — removing Geyser + Via plugins...");
+    log("[Bridge] Disabling Bedrock support — removing Geyser + Via + Floodgate plugins...");
     await fs.rm(GEYSER_JAR_PATH, { force: true });
     await fs.rm(VIAVERSION_JAR_PATH, { force: true });
     await fs.rm(VIABACKWARDS_JAR_PATH, { force: true });
+    await fs.rm(FLOODGATE_JAR_PATH, { force: true });
     await fs.rm(path.join(PLUGINS_DIR, "Geyser-Spigot"), { force: true, recursive: true });
     log("[Bridge] Bedrock support removed — Java-only from next start");
   }
+
+  broadcast("settings.update", { settings: state.settings });
+  return snapshot();
+}
+
+// Lets the user opt a java_bedrock install into Floodgate (its own Bedrock-player identity)
+// instead of the default shared "offline" identity, or back out of it. Opt-in and reversible —
+// see state.settings.bedrockAuth and FLOODGATE_JAR_PATH comments for why this isn't the
+// default. Mirrors setServerMode()'s stop-before-touching-plugins pattern, since Paper only
+// loads plugin configs at startup.
+async function setBedrockAuth(authType) {
+  if (authType !== "offline" && authType !== "floodgate") throw new Error(`Invalid Bedrock auth type: ${authType}`);
+  if (state.settings.mode !== "java_bedrock") throw new Error("Bedrock support isn't enabled — turn on Java + Bedrock mode first");
+  if (state.settings.bedrockAuth === authType) return snapshot();
+
+  if (serverProcess) {
+    log("[Bridge] Stopping server before changing Bedrock auth mode...");
+    await stopServer();
+  }
+
+  state.settings.bedrockAuth = authType;
+  await saveServerMode(state.settings.mode);
+  await fs.mkdir(PLUGINS_DIR, { recursive: true });
+
+  if (authType === "floodgate") {
+    await ensureFloodgateJar();
+  } else {
+    await fs.rm(FLOODGATE_JAR_PATH, { force: true });
+  }
+  await writeGeyserConfig(true);
+  log(`[Bridge] Bedrock auth set to "${authType}" — start/restart the server to apply`);
 
   broadcast("settings.update", { settings: state.settings });
   return snapshot();
@@ -1295,13 +1636,21 @@ async function handleRequest(action, payload = {}) {
     case "server.command":         return sendCommand(String(payload.command || ""));
     case "server.settings.update": return applySettings(payload);
     case "server.mode.switch":     return setServerMode(String(payload.mode || ""));
+    case "bedrock.auth.set":       return setBedrockAuth(String(payload.authType || ""));
+    case "system.ram":             return getSystemRam();
     case "server.snapshot":        await getWorlds(); await getPacks(); return snapshot();
     case "world.delete":           return deleteWorld(String(payload.worldId || ""));
+    case "world.backup":           return backupWorld(String(payload.folder || ""));
+    case "world.backups.list":     return { backups: await getBackups() };
+    case "world.backup.restore":   return restoreBackup(String(payload.backupId || ""));
+    case "world.backup.delete":    return deleteBackup(String(payload.backupId || ""));
     case "pack.delete":            return deletePack(String(payload.packId || ""));
     case "pack.refresh":           await getPacks(); broadcast("packs.update", { packs: state.packs }); return snapshot();
     case "plugin.list":            return pluginList();
     case "plugin.install":         return pluginInstall(String(payload.url || ""), String(payload.name || ""));
     case "plugin.delete":          return pluginDelete(String(payload.name || ""));
+    case "plugin.search":          return { results: await pluginSearch(String(payload.query || ""), String(payload.type || "plugin")) };
+    case "plugin.install.modrinth": return pluginInstallFromModrinth(String(payload.slug || ""), String(payload.type || "plugin"));
     case "file.list":              return fileList(String(payload.dir || ""));
     case "file.read":              return fileRead(String(payload.path || ""));
     case "file.write":             return fileWrite(String(payload.path || ""), String(payload.content || ""));
