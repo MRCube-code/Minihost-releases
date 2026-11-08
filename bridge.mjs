@@ -1066,6 +1066,47 @@ async function getPacks() {
   return packs;
 }
 
+// ─── Resource pack uploads ──────────────────────────────────────────────────────
+// BEFORE: the Packs tab only explained how to manually drop a .zip into
+// ~/pockethost/paper/resourcepacks/ via Termux — no in-app way to add one at all.
+// AFTER: the Packs tab can pick a .zip straight from the device's Downloads/Files via
+// expo-document-picker and send it here as base64 over the same WebSocket already used
+// for every other request — no separate HTTP upload server needed. Capped well under ws's
+// own default 100 MiB message limit (confirmed in the ws docs: maxPayload defaults to
+// 104857600 bytes) — base64 inflates raw size by ~4/3, so a 60 MB cap here stays safely
+// under that limit even with JSON framing overhead, and fails fast with a clear error
+// instead of silently stalling the WebSocket on an oversized pack.
+const MAX_PACK_UPLOAD_MB = 60;
+
+async function packInstallFromUpload(filename, dataBase64) {
+  // path.basename strips any directory components the picker's filename might carry,
+  // so this can never write outside RES_PACKS_DIR.
+  const safeName = path.basename(String(filename || "").trim());
+  if (!safeName || !safeName.toLowerCase().endsWith(".zip")) {
+    throw new Error("Resource packs must be a .zip file");
+  }
+  if (!dataBase64) throw new Error("No file data received");
+
+  const buf = Buffer.from(dataBase64, "base64");
+  if (buf.length === 0) throw new Error("Uploaded file is empty");
+  if (buf.length > MAX_PACK_UPLOAD_MB * 1024 * 1024) {
+    throw new Error(`Pack is too large (max ${MAX_PACK_UPLOAD_MB} MB)`);
+  }
+  // Same "is this really a zip" check pluginInstall() already uses for jars (PK magic bytes).
+  if (buf[0] !== 0x50 || buf[1] !== 0x4b) {
+    throw new Error("That file isn't a valid .zip resource pack");
+  }
+
+  await fs.mkdir(RES_PACKS_DIR, { recursive: true });
+  const dest = path.join(RES_PACKS_DIR, safeName);
+  await fs.writeFile(dest, buf);
+  log(`[Bridge] Resource pack added: ${safeName} (${Math.round(buf.length / (1024 * 1024))} MB)`);
+
+  await getPacks();
+  broadcast("packs.update", { packs: state.packs });
+  return { installed: safeName };
+}
+
 // ─── Plugin management ────────────────────────────────────────────────────────
 
 async function pluginList() {
@@ -1646,6 +1687,7 @@ async function handleRequest(action, payload = {}) {
     case "world.backup.delete":    return deleteBackup(String(payload.backupId || ""));
     case "pack.delete":            return deletePack(String(payload.packId || ""));
     case "pack.refresh":           await getPacks(); broadcast("packs.update", { packs: state.packs }); return snapshot();
+    case "pack.upload":            return packInstallFromUpload(String(payload.filename || ""), String(payload.dataBase64 || ""));
     case "plugin.list":            return pluginList();
     case "plugin.install":         return pluginInstall(String(payload.url || ""), String(payload.name || ""));
     case "plugin.delete":          return pluginDelete(String(payload.name || ""));
