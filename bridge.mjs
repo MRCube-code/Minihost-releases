@@ -4,7 +4,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { WebSocketServer } from "ws";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────────
 
 const HOME             = os.homedir();
 const POCKETHOST_DIR   = path.join(HOME, "pockethost");
@@ -40,7 +40,7 @@ const FLOODGATE_JAR_PATH = path.join(PLUGINS_DIR, "floodgate-spigot.jar");
 //        referenced below was run/observed on a real device before being written here.
 const PLAYIT_DIR          = path.join(POCKETHOST_DIR, "playit");
 // World backups — see backupWorld()/backupAllWorlds() below. Mirrors Aternos' "automatic
-// backup on stop" and Minehut's "manual backup from dashboard" features — Pocket Host had
+// backup on stop" and Minehut's "manual backup from dashboard" features — Mini Host had
 // no backup of any kind before this (worlds could only be deleted).
 const BACKUPS_DIR         = path.join(POCKETHOST_DIR, "backups");
 const PLAYIT_TUNNELS_FILE = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
@@ -63,7 +63,7 @@ const FLOODGATE_URL    = "https://download.geysermc.org/v2/projects/floodgate/ve
 const PAPER_API_BASE   = "https://fill.papermc.io/v3/projects/paper";
 // PaperMC's docs explicitly state requests must send a non-generic User-Agent with contact info,
 // or they "may be rejected or rate-limited." wget's default UA is exactly what they reject.
-const PAPER_USER_AGENT = "PocketHost/1.0 (+https://github.com/MRCube-code/Pocket-host-)";
+const PAPER_USER_AGENT = "MiniHost/1.0 (+https://github.com/MRCube-code/Pocket-host-)";
 const READY_PATTERNS   = [/Done \(/i, /\[Server thread\/INFO\].*Done/i];
 const ALLOWED_BASE     = POCKETHOST_DIR;
 // Persists the user's Java-only vs Java+Bedrock choice across bridge restarts —
@@ -106,7 +106,7 @@ async function installPlayitInDebian() {
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────
 
 function getLocalIp() {
   try {
@@ -130,7 +130,7 @@ function getLocalIp() {
   return "check-wifi";
 }
 
-// ─── State ────────────────────────────────────────────────────────────────────
+// ─── State ──────────────────────────────────────────────────────────────────
 
 const state = {
   serverStatus: "stopped",
@@ -139,8 +139,8 @@ const state = {
   stats: { cpuPercent: 0, ramUsedMb: 0, ramLimitMb: 2048, tps: 20, uptimeSeconds: 0 },
   settings: {
     gamemode: "survival", difficulty: "normal", maxPlayers: 20, ramMb: 2048,
-    port: 25565, bedrockPort: 19132, serverName: "PocketHost Server",
-    motd: "Powered by PocketHost", onlineMode: false, viewDistance: 8,
+    port: 25565, bedrockPort: 19132, serverName: "Mini Host Server",
+    motd: "Powered by Mini Host", onlineMode: false, viewDistance: 8,
     pvp: true, allowFlight: false, whiteList: false,
     mode: null, // 'java' | 'java_bedrock' — null means not yet chosen; set by loadServerMode()
     // 'offline' (default, matches every server shipped before this field existed) lets Bedrock
@@ -167,7 +167,7 @@ let serverProcess = null, playitProcess = null, playitRestartTimer = null, stats
 let playitSetupInProgress = false;   // prevents two concurrent installs (fixes the dpkg lock contention bug)
 const clients = new Set();
 
-// ─── Logging & broadcast ──────────────────────────────────────────────────────
+// ─── Logging & broadcast ───────────────────────────────────────────────
 
 function log(line) {
   const formatted = `[${new Date().toLocaleTimeString()}] ${line}`;
@@ -196,7 +196,7 @@ function snapshot() {
   };
 }
 
-// ─── Core utilities ───────────────────────────────────────────────────────────
+// ─── Core utilities ────────────────────────────────────────────────────────
 
 // BEFORE: wget(url, dest) took no extra args — no way to send a required header.
 // AFTER: optional extraArgs lets callers (Paper downloads) attach --header for User-Agent.
@@ -355,7 +355,7 @@ async function setupPhAlias() {
   } catch {}
 }
 
-// ─── Playit (proot-Debian) ─────────────────────────────────────────────────────
+// ─── Playit (proot-Debian) ───────────────────────────────────────────────────────
 
 // BEFORE: downloaded a native ARM64 binary — proven broken (no /run directory in Termux).
 // AFTER: ensures Debian is installed (checked via `proot-distro list`'s real confirmed
@@ -445,7 +445,7 @@ function parsePlayitLine(line) {
   log(`[playit] ${clean}`);
   let changed = false;
 
-  // ── CONFIRMED REAL: successful connection ─────────────────────────────────
+  // ── CONFIRMED REAL: successful connection ──────────────────────────────
   const connectedMatch = clean.match(/playit connected;\s*tunnels loaded.*?tunnel_count=(\d+).*?account_status="?(\w+)"?/i);
   if (connectedMatch) {
     state.tunnel.state    = "connected";
@@ -461,7 +461,7 @@ function parsePlayitLine(line) {
   //    'setup' found"). AFTER: this build of playit cannot generate its own claim link
   //    at all (confirmed: left running 60+s with no secret, never printed one) — the
   //    user supplies a secret key generated on playit.gg's own website instead, via the
-  //    playit.set_secret action. ──────────────────────────────────────────────────────
+  //    playit.set_secret action. ────────────────────────────────────────
   if (/waiting for frontend secret provisioning/i.test(clean)) {
     state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
@@ -499,7 +499,7 @@ function parsePlayitLine(line) {
     // intentionally no state change — see comment above
   }
 
-  // ── Clean shutdown — CONFIRMED real sequence from your Ctrl+C test ────────
+  // ── Clean shutdown — CONFIRMED real sequence from your Ctrl+C test ──────────
   if (/playitd shutdown complete/i.test(clean)) {
     state.tunnel.online = false;
     if (state.tunnel.state !== "waiting_auth") state.tunnel.state = "disconnected";
@@ -508,7 +508,7 @@ function parsePlayitLine(line) {
 
   // ── Tunnel address extraction — BEST EFFORT, unconfirmed against a real
   //    address line from this daemon. ply.gg is a real confirmed playit.gg
-  //    domain; kept as a reasonable attempt but flagged honestly as unverified. ──
+  //    domain; kept as a reasonable attempt but flagged honestly as unverified. ───
   const mapMatch = clean.match(/([a-z0-9.-]+\.ply\.gg:\d+)\s*(?:=>|->)?\s*[\d.]*:?(\d+)?/i);
   if (mapMatch) {
     const addr = mapMatch[1];
@@ -702,7 +702,7 @@ async function stopPlayit() {
   broadcast("tunnel.status", { tunnel: state.tunnel });
 }
 
-// ─── Paper API ────────────────────────────────────────────────────────────────
+// ─── Paper API ───────────────────────────────────────────────────────
 
 // BEFORE: v2 response was `{ versions: ["1.20.1", "1.20.2", ...] }` — a flat array,
 //         last element assumed latest.
@@ -769,7 +769,7 @@ async function getPaperVersionList() {
   }
 }
 
-// ─── Server setup ─────────────────────────────────────────────────────────────
+// ─── Server setup ──────────────────────────────────────────────────────────
 
 async function writeGeyserConfig(force = false) {
   const dir = path.join(PLUGINS_DIR, "Geyser-Spigot");
@@ -778,9 +778,9 @@ async function writeGeyserConfig(force = false) {
   if (!force && await exists(cfg)) return;
   const config = [
     `bedrock:`, `  address: 0.0.0.0`, `  port: ${state.settings.bedrockPort}`,
-    `  clone-remote-port: false`, `  motd1: "${state.settings.serverName || "PocketHost"}"`,
-    `  motd2: "${state.settings.motd || "Powered by PocketHost"}"`,
-    `  server-name: "${state.settings.serverName || "PocketHost"}"`,
+    `  clone-remote-port: false`, `  motd1: "${state.settings.serverName || "Mini Host"}"`,
+    `  motd2: "${state.settings.motd || "Powered by Mini Host"}"`,
+    `  server-name: "${state.settings.serverName || "Mini Host"}"`,
     `remote:`, `  address: 127.0.0.1`,
     // BEFORE: hardcoded "offline" — Floodgate could never actually be used even once added.
     // AFTER: reads the opt-in toggle; still defaults to "offline" for every existing server.
@@ -924,9 +924,9 @@ async function getWorlds() {
   return worlds;
 }
 
-// ─── World backups ────────────────────────────────────────────────────────────
+// ─── World backups ─────────────────────────────────────────────────
 // Aternos auto-backs-up to Google Drive on every server stop; Minehut offers manual backups
-// from its dashboard. Pocket Host had neither — worlds could only be deleted. This adds
+// from its dashboard. Mini Host had neither — worlds could only be deleted. This adds
 // local .tar.gz backups (device storage, no cloud account needed) with the same two modes:
 // automatic (before anything that touches the world — a version/mode switch) and manual
 // (a Backup button in the Worlds tab).
@@ -1066,7 +1066,7 @@ async function getPacks() {
   return packs;
 }
 
-// ─── Resource pack uploads ──────────────────────────────────────────────────────
+// ─── Resource pack uploads ────────────────────────────────────────────────────────
 // BEFORE: the Packs tab only explained how to manually drop a .zip into
 // ~/pockethost/paper/resourcepacks/ via Termux — no in-app way to add one at all.
 // AFTER: the Packs tab can pick a .zip straight from the device's Downloads/Files via
@@ -1107,7 +1107,7 @@ async function packInstallFromUpload(filename, dataBase64) {
   return { installed: safeName };
 }
 
-// ─── Plugin management ────────────────────────────────────────────────────────
+// ─── Plugin management ───────────────────────────────────────────────────────
 
 async function pluginList() {
   await fs.mkdir(PLUGINS_DIR, { recursive: true });
@@ -1148,7 +1148,7 @@ async function pluginDelete(name) {
   return { deleted: filename };
 }
 
-// ─── Modrinth plugin/mod browser ───────────────────────────────────────────────
+// ─── Modrinth plugin/mod browser ──────────────────────────────────────────────
 // Both Aternos and Minehut let you search and one-tap install plugins/mods from a library
 // instead of needing a direct .jar URL (which was previously the only way to install one
 // here). Modrinth's public API is used — confirmed live and working against the real
@@ -1199,7 +1199,7 @@ async function pluginInstallFromModrinth(slug, projectType) {
   return pluginInstall(url, filename);
 }
 
-// ─── File management ──────────────────────────────────────────────────────────
+// ─── File management ────────────────────────────────────────────────────────
 
 function isSafePath(p) { return path.resolve(p).startsWith(path.resolve(ALLOWED_BASE)); }
 
@@ -1667,7 +1667,7 @@ async function applySettings(payload) {
   return snapshot();
 }
 
-// ─── Request handler ──────────────────────────────────────────────────────────
+// ─── Request handler ───────────────────────────────────────────────────────────
 
 async function handleRequest(action, payload = {}) {
   switch (action) {
@@ -1700,7 +1700,7 @@ async function handleRequest(action, payload = {}) {
     case "server.versions":        return getPaperVersionList();
     case "server.version.switch":  return switchPaperVersion(String(payload.tag || ""));
 
-    // ── Playit ──────────────────────────────────────────────────────────────
+    // ── Playit ──────────────────────────────────────────────────────
 
     // BEFORE: downloaded a native ARM64 binary (proven broken — no /run in Termux).
     // AFTER: ensures Debian + playitd are installed, then starts the daemon. Connection
@@ -1850,7 +1850,7 @@ async function handleRequest(action, payload = {}) {
   }
 }
 
-// ─── Bootstrap ────────────────────────────────────────────────────────────────
+// ─── Bootstrap ─────────────────────────────────────────────────────────────
 
 async function bootstrap() {
   await ensureDirs();
@@ -1887,7 +1887,7 @@ async function bootstrap() {
   //        while the server is running.
 
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 8765 });
-  console.log("[Bridge] PocketHost listening on ws://127.0.0.1:8765");
+  console.log("[Bridge] Mini Host listening on ws://127.0.0.1:8765");
   console.log("[Bridge] Tip: type 'ph' next time to start bridge");
 
   wss.on("connection", ws => {
