@@ -7,71 +7,32 @@ import { WebSocketServer } from "ws";
 // ─── Constants ──────────────────────────────────────────────────────────
 
 const HOME             = os.homedir();
-const POCKETHOST_DIR   = path.join(HOME, "pockethost");
-const PAPER_DIR        = path.join(POCKETHOST_DIR, "paper");
+const MINIHOST_DIR     = path.join(HOME, "minihost");
+const PAPER_DIR        = path.join(MINIHOST_DIR, "paper");
 const PLUGINS_DIR      = path.join(PAPER_DIR, "plugins");
 const RES_PACKS_DIR    = path.join(PAPER_DIR, "resourcepacks");
 const SERVER_PROPERTIES_PATH = path.join(PAPER_DIR, "server.properties");
 const EULA_PATH        = path.join(PAPER_DIR, "eula.txt");
 const PAPER_JAR_PATH   = path.join(PAPER_DIR, "paper.jar");
 const GEYSER_JAR_PATH  = path.join(PLUGINS_DIR, "Geyser-Spigot.jar");
-// BEFORE: filenames pinned the jar to a specific ViaVersion/ViaBackwards release
-//         (ViaVersion-5.9.1.jar), so the download URL had to be bumped by hand every time
-//         upstream shipped a new build — and it wasn't: 5.9.1 predates ViaVersion 5.10.0's
-//         "Added 26.2 client support" release (confirmed via Hangar changelog), meaning the
-//         pinned jar silently couldn't bridge current Minecraft clients at all.
-// AFTER: fixed local filenames, resolved dynamically to whatever GitHub's "latest release"
-//        actually is at install time (see getLatestGithubAsset/ensureViaJars below) — same
-//        "download once, keep using the local file" pattern Geyser already uses above.
 const VIAVERSION_JAR_PATH   = path.join(PLUGINS_DIR, "ViaVersion.jar");
 const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards.jar");
-// Floodgate lets Bedrock players join without a linked Java/Microsoft account. Opt-in (see
-// state.settings.bedrockAuth) — the long-standing default is auth-type: offline, and flipping
-// a running server to Floodgate changes Bedrock players' UUIDs, which can orphan their
-// existing inventories/playerdata. Default stays "offline" so nobody is switched without asking.
 const FLOODGATE_JAR_PATH = path.join(PLUGINS_DIR, "floodgate-spigot.jar");
 
-// Playit — proot-Debian approach.
-// BEFORE: downloaded a native ARM64 binary and ran it directly in Termux.
-// AFTER: PROVEN BROKEN by real device testing — playitd's IPC socket bind fails with
-//        ENOENT because Termux has no /run directory (confirmed twice, including with an
-//        XDG_RUNTIME_DIR workaround that did NOT fix it). Confirmed working instead: playitd
-//        runs correctly inside a proot-distro Debian container. Every command and log line
-//        referenced below was run/observed on a real device before being written here.
-const PLAYIT_DIR          = path.join(POCKETHOST_DIR, "playit");
-// World backups — see backupWorld()/backupAllWorlds() below. Mirrors Aternos' "automatic
-// backup on stop" and Minehut's "manual backup from dashboard" features — Mini Host had
-// no backup of any kind before this (worlds could only be deleted).
-const BACKUPS_DIR         = path.join(POCKETHOST_DIR, "backups");
+const PLAYIT_DIR          = path.join(MINIHOST_DIR, "playit");
+const BACKUPS_DIR         = path.join(MINIHOST_DIR, "backups");
 const PLAYIT_TUNNELS_FILE = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
 const PLAYIT_SECRET_FILE  = path.join(PLAYIT_DIR, "secret.key");      // playit.gg agent secret, pasted by the user once
 const DEBIAN_DISTRO       = "debian";
-// Confirmed real: `proot-distro login debian -- playitd` starts the daemon non-interactively.
-// Confirmed real success line: "playit connected; tunnels loaded agent_id=... tunnel_count=2
-//   ... account_status=\"verified\"". Confirmed real shutdown: SIGINT triggers a clean
-//   shutdown sequence ("Received Ctrl+C, shutting down" -> "playitd shutdown complete").
-// Confirmed real claim flow from your own shell history: `playitd` in one session,
-//   `playit setup` in a second session while the daemon is running.
 
 const GEYSER_URL       = "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot";
-// Floodgate ships from the same GeyserMC download server as Geyser itself, same "spigot"
-// platform (confirmed: download.geysermc.org/v2/projects/floodgate exists with a spigot build).
 const FLOODGATE_URL    = "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot";
-// BEFORE: "https://api.papermc.io/v2/projects/paper" — PaperMC's v2 downloads API was
-//         deprecated Dec 31, 2025 and fully shut off July 1, 2026, returning HTTP 410 Gone.
-// AFTER: PaperMC's replacement is the "Fill" API (confirmed at docs.papermc.io/misc/downloads-service/).
 const PAPER_API_BASE   = "https://fill.papermc.io/v3/projects/paper";
-// PaperMC's docs explicitly state requests must send a non-generic User-Agent with contact info,
-// or they "may be rejected or rate-limited." wget's default UA is exactly what they reject.
-const PAPER_USER_AGENT = "MiniHost/1.0 (+https://github.com/MRCube-code/Pocket-host-)";
+const PAPER_USER_AGENT = "MiniHost/1.0 (+https://github.com/MRCube-code/Mini-Host)";
 const READY_PATTERNS   = [/Done \(/i, /\[Server thread\/INFO\].*Done/i];
-const ALLOWED_BASE     = POCKETHOST_DIR;
-// Persists the user's Java-only vs Java+Bedrock choice across bridge restarts —
-// state.settings is in-memory only otherwise.
-const MODE_FILE        = path.join(POCKETHOST_DIR, "server-mode.json");
+const ALLOWED_BASE     = MINIHOST_DIR;
+const MODE_FILE        = path.join(MINIHOST_DIR, "server-mode.json");
 
-// Confirmed real: `pkg install proot-distro -y` then `proot-distro install debian`
-// (you ran this exact sequence, install took 5-8 minutes, one time only).
 async function installProotDebian() {
   log("[Bridge] Installing proot-distro...");
   await runCmd("pkg", ["install", "-y", "proot-distro"]);
@@ -80,20 +41,6 @@ async function installProotDebian() {
   log("[Bridge] Debian installed");
 }
 
-// Confirmed real, run inside Debian: apt update && apt install -y curl gpg ca-certificates
-//                                    && curl -fsSL https://packages.playit.gg/install.sh | bash
-//
-// BEFORE: treated any non-zero exit as a hard failure.
-// AFTER: real evidence from your device shows the installer script's OWN final step asks
-//        "Would you like to start playit now to finish setup? [Y/n]" and then tries to use
-//        systemctl to start/check the service — which always fails in proot (confirmed
-//        three times now: your original Debian test, this install hook, and running bare
-//        `playit` interactively — all hit the exact same "not booted with systemd" error).
-//        That failure happens AFTER dpkg has already installed the actual playitd binary,
-//        so a non-zero exit here doesn't mean the install failed. We no longer throw on
-//        this specific command's exit code — ensurePlayitReady() re-verifies with the
-//        already-trusted `which playitd` check right after calling this, and only that
-//        re-check decides real success or failure.
 async function installPlayitInDebian() {
   log("[Bridge] Installing playit inside Debian...");
   try {
@@ -105,8 +52,6 @@ async function installPlayitInDebian() {
     log(`[Bridge] Install script exited non-zero (${err.message.slice(0, 150)}) — this is expected if it's the known systemd post-install hook; verifying playitd exists anyway...`);
   }
 }
-
-// ─── Helpers ──────────────────────────────────────────────────────────
 
 function getLocalIp() {
   try {
@@ -130,8 +75,6 @@ function getLocalIp() {
   return "check-wifi";
 }
 
-// ─── State ──────────────────────────────────────────────────────────────────
-
 const state = {
   serverStatus: "stopped",
   logs: [],
@@ -142,20 +85,15 @@ const state = {
     port: 25565, bedrockPort: 19132, serverName: "Mini Host Server",
     motd: "Powered by Mini Host", onlineMode: false, viewDistance: 8,
     pvp: true, allowFlight: false, whiteList: false,
-    mode: null, // 'java' | 'java_bedrock' — null means not yet chosen; set by loadServerMode()
-    // 'offline' (default, matches every server shipped before this field existed) lets Bedrock
-    // players join without a linked Xbox account; 'floodgate' gives each Bedrock player their
-    // own Floodgate identity instead. Opt-in only — see setBedrockAuth(). Persisted alongside
-    // `mode` in MODE_FILE so the choice survives a bridge restart.
-    bedrockAuth: "offline", // 'offline' | 'floodgate'
+    mode: null,
+    bedrockAuth: "offline",
   },
   worlds: [],
   packs: [],
   tunnel: {
     online:          false,
-    // Five states the UI displays
-    state:           "disconnected",  // 'connecting'|'waiting_auth'|'connected'|'disconnected'|'error'
-    claimUrl:        "",              // populated when state === 'waiting_auth'
+    state:           "disconnected",
+    claimUrl:        "",
     javaAddress:     "",
     bedrockAddress:  "",
     method:          "playit",
@@ -164,10 +102,8 @@ const state = {
 };
 
 let serverProcess = null, playitProcess = null, playitRestartTimer = null, statsInterval = null;
-let playitSetupInProgress = false;   // prevents two concurrent installs (fixes the dpkg lock contention bug)
+let playitSetupInProgress = false;
 const clients = new Set();
-
-// ─── Logging & broadcast ───────────────────────────────────────────────
 
 function log(line) {
   const formatted = `[${new Date().toLocaleTimeString()}] ${line}`;
@@ -196,19 +132,10 @@ function snapshot() {
   };
 }
 
-// ─── Core utilities ────────────────────────────────────────────────────────
-
-// BEFORE: wget(url, dest) took no extra args — no way to send a required header.
-// AFTER: optional extraArgs lets callers (Paper downloads) attach --header for User-Agent.
 function wget(url, dest, extraArgs = []) {
   return runCmd("wget", ["-q", "--show-progress", ...extraArgs, "-O", dest, url]);
 }
 
-// BEFORE: getLatestPaperVersion/getLatestPaperBuild each hand-rolled a spawn("wget", ["-q", ...])
-//         with -q suppressing wget's real stderr, so every failure just said "wget Paper API failed"
-//         with zero diagnostic value (this is exactly what cost a full debugging round-trip).
-// AFTER: single JSON-fetch helper that always sends the required User-Agent header and, on
-//        failure, includes wget's actual exit code and stderr in the thrown error.
 function wgetJson(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn("wget", ["-q", "-O", "-", "--header", `User-Agent: ${PAPER_USER_AGENT}`, url], { stdio: ["ignore", "pipe", "pipe"] });
@@ -224,9 +151,6 @@ function wgetJson(url) {
   });
 }
 
-// Generic dotted-numeric version comparator — used to find the true latest version
-// rather than trusting the API's object key order (mirrors the `sort -V -r` approach
-// PaperMC's own example scripts use as a fallback).
 function compareVersions(a, b) {
   const pa = String(a).split(".").map(n => parseInt(n, 10) || 0);
   const pb = String(b).split(".").map(n => parseInt(n, 10) || 0);
@@ -238,10 +162,6 @@ function compareVersions(a, b) {
   return 0;
 }
 
-// Resolves a GitHub repo's latest release asset whose filename matches `assetPattern`, via the
-// repos/{owner}/{repo}/releases/latest API. Reuses wgetJson, which already sends a required
-// User-Agent header on every request — GitHub's API rejects anonymous/UA-less requests the
-// same way PaperMC's Fill API does, so the existing helper works here unchanged.
 async function getLatestGithubAsset(owner, repo, assetPattern) {
   const release = await wgetJson(`https://api.github.com/repos/${owner}/${repo}/releases/latest`);
   const asset = (release.assets || []).find(a => assetPattern.test(a.name));
@@ -249,11 +169,6 @@ async function getLatestGithubAsset(owner, repo, assetPattern) {
   return { tag: release.tag_name, url: asset.browser_download_url, name: asset.name };
 }
 
-// Downloads ViaVersion/ViaBackwards if the local jar is missing, resolving "latest" from
-// GitHub releases instead of a hardcoded version/URL (see VIAVERSION_JAR_PATH comment above).
-// Mirrors Geyser's existing "only fetch if not already on disk" pattern — there's no periodic
-// re-check, same as Geyser; removeOldViaJars() clears out any previous versioned filename
-// first so an existing install picks up the dynamic-latest jar on its next install/mode-switch.
 async function ensureViaJars() {
   await removeOldViaJars();
   if (!(await exists(VIAVERSION_JAR_PATH))) {
@@ -272,8 +187,6 @@ async function ensureViaJars() {
   }
 }
 
-// Downloads Floodgate if the local jar is missing. Only called when bedrockAuth === 'floodgate'
-// (opt-in — see state.settings.bedrockAuth).
 async function ensureFloodgateJar() {
   if (!(await exists(FLOODGATE_JAR_PATH))) {
     log("[Bridge] Downloading Floodgate (lets Bedrock players join without a linked Xbox account)...");
@@ -282,10 +195,6 @@ async function ensureFloodgateJar() {
   }
 }
 
-// Total physical RAM Termux can see on this device, read from /proc/meminfo (the same file
-// the stats poller already reads for live ramUsedMb). Lets the Settings screen build a RAM
-// slider in whole-GB steps scaled to what THIS phone actually has, instead of a fixed MB range
-// nobody can mentally convert.
 async function getSystemRam() {
   try {
     const mem = await fs.readFile("/proc/meminfo", "utf8");
@@ -311,22 +220,13 @@ function runCmd(cmd, args, opts = {}) {
 async function exists(p) { try { await fs.access(p); return true; } catch { return false; } }
 
 async function ensureDirs() {
-  for (const d of [POCKETHOST_DIR, PAPER_DIR, PLUGINS_DIR, RES_PACKS_DIR, PLAYIT_DIR, BACKUPS_DIR])
+  for (const d of [MINIHOST_DIR, PAPER_DIR, PLUGINS_DIR, RES_PACKS_DIR, PLAYIT_DIR, BACKUPS_DIR])
     await fs.mkdir(d, { recursive: true });
 }
 
-// Persists the Java-only vs Java+Bedrock choice so it survives bridge restarts.
-// For an existing install that already has Geyser downloaded, infers "java_bedrock"
-// from the actual file on disk rather than forcing a re-choice; a genuinely new
-// install gets `mode: null`, which the UI treats as "not yet chosen."
 async function loadServerMode() {
   try {
     const data = JSON.parse(await fs.readFile(MODE_FILE, "utf8"));
-    // BEFORE: only `mode` was persisted — bedrockAuth silently reset to "offline" on every
-    //         bridge restart, which would quietly undo a user's Floodgate opt-in.
-    // AFTER: bedrockAuth is read back too; absent in an older/pre-existing MODE_FILE just
-    //        means "offline" (the default already set in state.settings), so this is backward
-    //        compatible with every MODE_FILE written before this field existed.
     if (data.bedrockAuth === "floodgate") state.settings.bedrockAuth = "floodgate";
     if (data.mode === "java" || data.mode === "java_bedrock") { state.settings.mode = data.mode; return; }
   } catch {}
@@ -339,37 +239,22 @@ async function loadServerMode() {
 }
 
 async function saveServerMode(mode) {
-  await fs.mkdir(POCKETHOST_DIR, { recursive: true });
+  await fs.mkdir(MINIHOST_DIR, { recursive: true });
   await fs.writeFile(MODE_FILE, JSON.stringify({ mode, bedrockAuth: state.settings.bedrockAuth || "offline" }));
 }
 
 async function setupPhAlias() {
   try {
     const bashrc = path.join(HOME, ".bashrc");
-    const alias  = `alias ph='pkill -f bridge.mjs 2>/dev/null; sleep 1; cd ~/Pocket-host-/termux && node bridge.mjs'`;
+    const alias  = `alias mh='pkill -f bridge.mjs 2>/dev/null; sleep 1; cd ~/Mini-Host/termux && node bridge.mjs'`;
     const content = await fs.readFile(bashrc, "utf8").catch(() => "");
-    if (!content.includes("alias ph=")) {
+    if (!content.includes("alias mh=")) {
       await fs.appendFile(bashrc, `\n${alias}\n`);
-      log("[Bridge] Added 'ph' shortcut — type 'ph' anytime to start bridge");
+      log("[Bridge] Added 'mh' shortcut — type 'mh' anytime to start bridge");
     }
   } catch {}
 }
 
-// ─── Playit (proot-Debian) ───────────────────────────────────────────────────────
-
-// BEFORE: downloaded a native ARM64 binary — proven broken (no /run directory in Termux).
-// AFTER: ensures Debian is installed (checked via `proot-distro list`'s real confirmed
-//        output format) and playitd exists inside it (checked via `which`, a standard
-//        Unix command, not a playit-specific guess).
-// BEFORE: no protection against concurrent calls. If startPlayit() (auto-triggered when
-//         Paper becomes ready) and a manual "Setup Tunnel" tap happened close together, both
-//         could call this at once — real observed symptom: two overlapping pkg/apt installs
-//         fighting over Termux's own dpkg lock ("Waiting for cache lock... held by process
-//         ... (apt)").
-// AFTER: memoizes the in-flight promise — any concurrent caller (startPlayit(), the
-//        playit.setup handler, schedulePlayitRestart()) just awaits the SAME real operation
-//        instead of starting a duplicate one. No call site needs to change; this wrapper
-//        keeps the original name so every existing caller is protected automatically.
 let ensurePlayitReadyPromise = null;
 function ensurePlayitReady() {
   if (!ensurePlayitReadyPromise) {
@@ -383,10 +268,6 @@ function ensurePlayitReady() {
 async function ensurePlayitReadyInner() {
   await fs.mkdir(PLAYIT_DIR, { recursive: true });
 
-  // Confirmed real output format:
-  //   Installed containers:
-  //     * debian
-  //   Log in with: proot-distro login <name>
   let listOutput = "";
   try {
     listOutput = execSync("proot-distro list 2>&1", { encoding: "utf8" });
@@ -409,8 +290,6 @@ async function ensurePlayitReadyInner() {
 
   if (!hasPlayitd) {
     await installPlayitInDebian();
-    // Re-verify with the same trusted check — this is the real authority on success,
-    // not the install script's own exit code (see comment on installPlayitInDebian).
     try {
       const r2 = execSync(`proot-distro login ${DEBIAN_DISTRO} -- which playitd 2>&1`, { encoding: "utf8" });
       hasPlayitd = r2.trim().length > 0 && !r2.includes("not found");
@@ -423,17 +302,6 @@ async function ensurePlayitReadyInner() {
   }
 }
 
-// Parse every line emitted by playitd running inside Debian.
-//
-// BEFORE: patterns were based on generic playit-agent behavior researched online, never
-//         confirmed against this project's actual runtime.
-// AFTER: the CONNECTED pattern is copied verbatim from a real confirmed log line from your
-//        device: "playit connected; tunnels loaded agent_id=... tunnel_count=2
-//        pending_tunnel_count=0 disabled_tunnel_count=0 account_status=\"verified\"".
-//        The WAITING_AUTH pattern ("Waiting for frontend secret provisioning") is from your
-//        own documented first-time-setup test. Tunnel address extraction is NOT yet
-//        confirmed against a real address line (your test was Ctrl+C'd before one appeared) —
-//        marked clearly as best-effort so it isn't mistaken for verified fact like the rest.
 function parsePlayitLine(line) {
   const clean = line
     .replace(/\x1b\[[0-9;]*m/g, "")
@@ -445,7 +313,6 @@ function parsePlayitLine(line) {
   log(`[playit] ${clean}`);
   let changed = false;
 
-  // ── CONFIRMED REAL: successful connection ──────────────────────────────
   const connectedMatch = clean.match(/playit connected;\s*tunnels loaded.*?tunnel_count=(\d+).*?account_status="?(\w+)"?/i);
   if (connectedMatch) {
     state.tunnel.state    = "connected";
@@ -455,60 +322,33 @@ function parsePlayitLine(line) {
     log(`[playit] Connected — ${connectedMatch[1]} tunnel(s), account ${connectedMatch[2]}`);
   }
 
-  // ── CONFIRMED REAL: no valid secret configured. BEFORE: auto-triggered
-  //    startClaimSetup() (`playit setup`) here — CONFIRMED broken, that subcommand no
-  //    longer exists in the installed playit 1.0.10 CLI ("error: unexpected argument
-  //    'setup' found"). AFTER: this build of playit cannot generate its own claim link
-  //    at all (confirmed: left running 60+s with no secret, never printed one) — the
-  //    user supplies a secret key generated on playit.gg's own website instead, via the
-  //    playit.set_secret action. ────────────────────────────────────────
   if (/waiting for frontend secret provisioning/i.test(clean)) {
     state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
     changed = true;
   }
 
-  // ── CONFIRMED REAL: a previously-saved secret was rejected by playit.gg (real line
-  //    from your device: "configured agent secret is no longer valid
-  //    error=ApiError(Auth(InvalidAgentKey))"). Clear the dead secret so startPlayit()
-  //    doesn't keep retrying with it, and report the same "needs a key" state. ────────
   if (/configured agent secret is no longer valid|InvalidAgentKey/i.test(clean)) {
     log("[playit] Saved secret was rejected by playit.gg — clearing it.");
     fs.rm(PLAYIT_SECRET_FILE, { force: true }).catch(() => {});
-    // Also wipe playitd's OWN persisted config (see clearPlayitdConfig() below) — leaving
-    // it behind means the next secret the user pastes gets silently shadowed by this same
-    // dead one, confirmed real on a device: multiple fresh secrets saved through the app
-    // all failed with this exact error, because playit.toml never stopped holding the
-    // very first (now-dead) secret this agent was ever given.
     clearPlayitdConfig().catch(() => {});
     state.tunnel.state  = "waiting_auth";
     state.tunnel.online = false;
     changed = true;
   }
 
-  // ── Reconnection churn — CONFIRMED to happen even during a successful run,
-  //    so this must NOT be treated as an error ─────────────────────────────
   if (/control session expired; reconnecting/i.test(clean)) {
-    // no-op — normal, observed during your successful test too
   }
 
-  // ── Real errors observed: network-level ping failures. Your real test showed
-  //    these recovering automatically within ~2 seconds and then connecting — so
-  //    don't flip to "error" here; the timeout in startPlayit() handles genuine stalls.
   if (/network unreachable|failed to (send initial ping|ping tunnel server)/i.test(clean) && state.tunnel.state !== "connected") {
-    // intentionally no state change — see comment above
   }
 
-  // ── Clean shutdown — CONFIRMED real sequence from your Ctrl+C test ──────────
   if (/playitd shutdown complete/i.test(clean)) {
     state.tunnel.online = false;
     if (state.tunnel.state !== "waiting_auth") state.tunnel.state = "disconnected";
     changed = true;
   }
 
-  // ── Tunnel address extraction — BEST EFFORT, unconfirmed against a real
-  //    address line from this daemon. ply.gg is a real confirmed playit.gg
-  //    domain; kept as a reasonable attempt but flagged honestly as unverified. ───
   const mapMatch = clean.match(/([a-z0-9.-]+\.ply\.gg:\d+)\s*(?:=>|->)?\s*[\d.]*:?(\d+)?/i);
   if (mapMatch) {
     const addr = mapMatch[1];
@@ -527,17 +367,6 @@ function parsePlayitLine(line) {
   if (changed) broadcast("tunnel.status", { tunnel: state.tunnel });
 }
 
-// BEFORE: switching to a new secret (or clearing a dead one) only ever touched our own
-//         secret.key cache. playitd keeps its OWN separate copy of whatever secret it was
-//         last given, persisted inside the Debian container at
-//         /root/.config/playit_gg/playit.toml — confirmed real on a device: after saving a
-//         brand new secret through the app, that file still held the OLD dead secret, and
-//         playitd kept authenticating with THAT instead of the fresh value passed via
-//         --secret on the command line. In other words, --secret only actually matters the
-//         very first time playitd runs with no config file yet; every run after that, a
-//         leftover config silently wins over whatever we pass.
-// AFTER: wipe playitd's own persisted config whenever we're about to hand it a different
-//        secret, so --secret can never be silently shadowed by a stale one again.
 async function clearPlayitdConfig() {
   try {
     await runCmd("proot-distro", ["login", DEBIAN_DISTRO, "--", "rm", "-rf", "/root/.config/playit_gg"]);
@@ -546,8 +375,6 @@ async function clearPlayitdConfig() {
   }
 }
 
-// Our own small cache of the user-pasted playit.gg secret key — see startPlayit()'s
-// BEFORE/AFTER comment below for why this replaces the old (now-broken) claim-link flow.
 async function getSavedSecret() {
   try {
     const s = (await fs.readFile(PLAYIT_SECRET_FILE, "utf8")).trim();
@@ -559,9 +386,6 @@ async function getSavedSecret() {
 
 async function saveSecret(secret) {
   await fs.mkdir(PLAYIT_DIR, { recursive: true });
-  // Clear playitd's stale persisted config first (see clearPlayitdConfig() above) — this
-  // MUST happen before the new secret is used, otherwise the new secret gets silently
-  // ignored in favor of whatever playitd already has saved internally.
   await clearPlayitdConfig();
   await fs.writeFile(PLAYIT_SECRET_FILE, secret.trim());
 }
@@ -579,19 +403,6 @@ async function startPlayit() {
     return;
   }
 
-  // BEFORE: spawned playitd with no secret and relied on startClaimSetup() (`playit
-  //         setup`) to generate a claim link — CONFIRMED broken: the installed playit
-  //         version (1.0.10) has no `setup`/`claim` subcommand at all anymore
-  //         ("error: unexpected argument 'setup' found"), and running the bare daemon
-  //         with no secret just hangs forever on "Waiting for frontend secret
-  //         provisioning over IPC" (confirmed: left running 60+s on a real device, no
-  //         claim link ever appeared).
-  // AFTER: the user pastes a secret key generated from playit.gg's own website
-  //        (confirmed real flow: playit.gg/account/setup/wizard -> "Docker" step shows
-  //        a SECRET_KEY=... value, even though Docker itself isn't used here) via the
-  //        playit.set_secret action. If we don't have one saved yet, don't spawn the
-  //        daemon at all — it would just hang — report waiting_auth so the app shows
-  //        the "enter your key" step instead.
   const secret = await getSavedSecret();
   if (!secret) {
     log("[playit] No secret key saved yet — waiting for one from the app.");
@@ -613,14 +424,6 @@ async function startPlayit() {
   broadcast("tunnel.status", { tunnel: state.tunnel });
   log("[playit] Starting playitd inside Debian...");
 
-  // CONFIRMED REAL on your device: `proot-distro login debian -- playitd` starts the
-  // daemon non-interactively and streams stdout/stderr normally. `--secret` is a
-  // confirmed real flag from `playitd --help` ("Inline secret key for the daemon").
-  // detached: true puts this in its own process group so stopPlayit() can signal the
-  // whole proot-distro/proot/playitd tree at once — a plain single-PID kill isn't
-  // guaranteed to reach playitd inside the proot jail, and that specific propagation
-  // path wasn't part of what you tested (only interactive Ctrl+C was confirmed, which
-  // the terminal itself broadcasts to the whole foreground process group automatically).
   playitProcess = spawn("proot-distro", ["login", DEBIAN_DISTRO, "--", "playitd", "--secret", secret], {
     stdio:    ["ignore", "pipe", "pipe"],
     detached: true,
@@ -633,10 +436,6 @@ async function startPlayit() {
   playitProcess.stdout.on("data", chunk => String(chunk).split(/\r?\n/).filter(Boolean).forEach(handleLine));
   playitProcess.stderr.on("data", chunk => String(chunk).split(/\r?\n/).filter(Boolean).forEach(handleLine));
 
-  // If neither "connected" nor "waiting_auth" shows up within a generous window, something
-  // is wrong that we don't have a confirmed pattern for — surface it honestly as an error
-  // with a concrete next step, rather than leaving the UI stuck on "connecting" forever.
-  // 25s is well above the ~4s connect time seen in your real test.
   const stuckTimer = setTimeout(() => {
     if (state.tunnel.state === "connecting") {
       log("[playit] No connection after 25s. Check your internet connection, and that the secret key entered in the Tunnel tab is correct (get a new one at playit.gg/account/setup/wizard).");
@@ -668,10 +467,6 @@ async function startPlayit() {
   });
 }
 
-// BEFORE: gated auto-restart on a marker file that guessed at playit's internal auth state.
-// AFTER: starting playitd is safe regardless of claim status (confirmed: it just prints
-//        "Waiting for frontend secret provisioning" and idles if unclaimed, doesn't error) —
-//        so this can simply retry unconditionally while the Minecraft server is running.
 async function schedulePlayitRestart() {
   if (playitRestartTimer) return;
   playitRestartTimer = setTimeout(async () => {
@@ -681,10 +476,6 @@ async function schedulePlayitRestart() {
   }, 30000);
 }
 
-// BEFORE: plain playitProcess.kill("SIGTERM") on the native binary.
-// AFTER: CONFIRMED real behavior is that SIGINT (Ctrl+C) triggers playitd's graceful
-//        shutdown sequence — SIGTERM was never tested. Signals the whole process group
-//        (see detached: true above) with a plain-kill fallback if that fails.
 async function stopPlayit() {
   if (playitRestartTimer) { clearTimeout(playitRestartTimer); playitRestartTimer = null; }
   if (playitProcess) {
@@ -702,32 +493,15 @@ async function stopPlayit() {
   broadcast("tunnel.status", { tunnel: state.tunnel });
 }
 
-// ─── Paper API ───────────────────────────────────────────────────────
-
-// BEFORE: v2 response was `{ versions: ["1.20.1", "1.20.2", ...] }` — a flat array,
-//         last element assumed latest.
-// AFTER: v3 response is `{ versions: { "1.21": ["1.21.10","1.21.11"], "1.20": [...] } }` —
-//        grouped by major version. Flatten every group, then pick the true latest via
-//        compareVersions() rather than trusting object/array order.
-// BEFORE: getLatestPaperVersion() picked the single highest version number and handed it
-//         straight to getLatestStablePaperBuild(), which threw if that version had zero
-//         STABLE builds. This is exactly what happened with "26.2-rc-2" — the newest entry
-//         in the version list was a release candidate with no stable build yet, so install
-//         failed completely even though fully-stable versions existed one step back.
-// AFTER: mirrors PaperMC's own documented pattern (docs.papermc.io/misc/downloads-service/,
-//        "Downloading the latest stable build" script): if the requested/latest version has
-//        no STABLE build, walk backward through the version list until one is found.
 async function getAllPaperVersionsSorted() {
   const data   = await wgetJson(PAPER_API_BASE);
   const groups = data.versions || {};
   const all    = Object.values(groups).flat();
   if (!all.length) throw new Error("No Paper versions returned by Fill API");
-  all.sort(compareVersions);   // ascending; last element = newest
+  all.sort(compareVersions);
   return all;
 }
 
-// Returns { version, build, url, sha256 } for a specific version, or null if that version
-// has no STABLE-channel build (not an error — RC/pre-release versions commonly have none).
 async function tryGetStablePaperBuild(version) {
   try {
     const builds = await wgetJson(`${PAPER_API_BASE}/versions/${version}/builds`);
@@ -743,8 +517,6 @@ async function tryGetStablePaperBuild(version) {
   }
 }
 
-// The actual "give me something installable" entry point — always succeeds if ANY
-// version has a stable build, regardless of whether the newest version does.
 async function getLatestStablePaper() {
   const all = await getAllPaperVersionsSorted();
   for (let i = all.length - 1; i >= 0; i--) {
@@ -769,8 +541,6 @@ async function getPaperVersionList() {
   }
 }
 
-// ─── Server setup ──────────────────────────────────────────────────────────
-
 async function writeGeyserConfig(force = false) {
   const dir = path.join(PLUGINS_DIR, "Geyser-Spigot");
   const cfg = path.join(dir, "config.yml");
@@ -782,8 +552,6 @@ async function writeGeyserConfig(force = false) {
     `  motd2: "${state.settings.motd || "Powered by Mini Host"}"`,
     `  server-name: "${state.settings.serverName || "Mini Host"}"`,
     `remote:`, `  address: 127.0.0.1`,
-    // BEFORE: hardcoded "offline" — Floodgate could never actually be used even once added.
-    // AFTER: reads the opt-in toggle; still defaults to "offline" for every existing server.
     `  port: ${state.settings.port}`, `  auth-type: ${state.settings.bedrockAuth === "floodgate" ? "floodgate" : "offline"}`,
     `metrics:`, `  enabled: false`, `  uuid: 00000000-0000-0000-0000-000000000000`,
   ].join("\n") + "\n";
@@ -803,13 +571,6 @@ async function initServerProperties() {
   await fs.writeFile(SERVER_PROPERTIES_PATH, lines.join("\n") + "\n");
 }
 
-// BEFORE: kept the specific "ViaVersion-5.9.1.jar"/"ViaBackwards-5.9.1.jar" pinned filenames,
-//         deleting any other (newer) jar an admin might have dropped in.
-// AFTER: the jar filenames are no longer version-pinned (see VIAVERSION_JAR_PATH comment) —
-//        this now only clears out *old-style* versioned filenames from installs that predate
-//        that change, so ensureViaJars() redownloads once under the new fixed name. It leaves
-//        the current fixed-name jars (ViaVersion.jar/ViaBackwards.jar) alone so an already
-//        up-to-date install doesn't get wiped and re-fetched on every call.
 async function removeOldViaJars() {
   const entries = await fs.readdir(PLUGINS_DIR).catch(() => []);
   for (const f of entries) {
@@ -821,15 +582,6 @@ async function removeOldViaJars() {
   }
 }
 
-// BEFORE: installPaper() always spawned the bare "java" command with no version awareness.
-//         Newer Paper builds (26.1+) require Java 25+; older Termux installs commonly only
-//         have openjdk-21. This produced a silent crash: Paper printed a clear error to
-//         stderr and exited, but bridge.mjs never read that error or acted on it.
-// AFTER: JAVA_BIN is resolved dynamically and can be upgraded at runtime. Confirmed real via
-//        termux/termux-packages issue #27045 (Oct 2025): `pkg install openjdk-25` is a real,
-//        current Termux package, installing to $PREFIX/lib/jvm/java-25-openjdk/bin/java —
-//        we use that exact path rather than hoping the "java" symlink updates itself, since
-//        Termux allows multiple openjdk-* packages to coexist.
 let JAVA_BIN = "java";
 
 function termuxJvmPath(majorVersion) {
@@ -837,8 +589,6 @@ function termuxJvmPath(majorVersion) {
   return path.join(prefix, "lib/jvm", `java-${majorVersion}-openjdk`, "bin", "java");
 }
 
-// Installs a specific Java major version via Termux's pkg manager if not already present.
-// Returns true and updates JAVA_BIN on success, false on failure (caller decides what to do).
 async function ensureJavaAtLeast(majorVersion) {
   const jvmPath = termuxJvmPath(majorVersion);
   if (await exists(jvmPath)) { JAVA_BIN = jvmPath; return true; }
@@ -871,17 +621,12 @@ async function installPaper() {
     log(`[Bridge] Paper ${version} ready`);
   }
 
-  // BEFORE: Geyser + ViaVersion + ViaBackwards were always downloaded, with no way to run
-  //         Java-only. Every install pulled Bedrock support whether wanted or not.
-  // AFTER: only installed when the user has chosen (or been inferred into) java_bedrock mode.
   if (state.settings.mode === "java_bedrock") {
     if (!(await exists(GEYSER_JAR_PATH))) {
       log("[Bridge] Downloading Geyser-Spigot (Bedrock support)...");
       await wget(GEYSER_URL, GEYSER_JAR_PATH);
       log("[Bridge] Geyser-Spigot ready");
     }
-    // BEFORE: downloaded ViaVersion/ViaBackwards pinned to the hardcoded 5.9.1 URLs inline here.
-    // AFTER: ensureViaJars() resolves "latest" from GitHub releases — see its own comment.
     await ensureViaJars();
     if (state.settings.bedrockAuth === "floodgate") await ensureFloodgateJar();
     await writeGeyserConfig();
@@ -893,9 +638,6 @@ async function installPaper() {
   await initServerProperties();
 }
 
-// BEFORE: used fs.stat(directory).size which returns the inode metadata size (~4 KB),
-//         so every world showed 1 MB due to Math.max(1, ...).
-// AFTER: uses `du -sm` to get the real recursive folder size in megabytes.
 async function getWorlds() {
   await ensureDirs();
   const worlds = [];
@@ -924,17 +666,6 @@ async function getWorlds() {
   return worlds;
 }
 
-// ─── World backups ─────────────────────────────────────────────────
-// Aternos auto-backs-up to Google Drive on every server stop; Minehut offers manual backups
-// from its dashboard. Mini Host had neither — worlds could only be deleted. This adds
-// local .tar.gz backups (device storage, no cloud account needed) with the same two modes:
-// automatic (before anything that touches the world — a version/mode switch) and manual
-// (a Backup button in the Worlds tab).
-
-// Installs `tar` via Termux's pkg manager if missing — same pattern as ensureJavaAtLeast()
-// above (check via `which`, install via pkg, re-verify). Not previously confirmed on a real
-// device the way ensureJavaAtLeast's openjdk packages were, so it's written defensively:
-// checked before every use, never assumed present.
 let hasTar = null;
 async function ensureTar() {
   if (hasTar) return true;
@@ -951,13 +682,9 @@ async function ensureTar() {
   }
 }
 
-// Keep only the newest N backups per world folder so auto-backups (triggered on every
-// version/mode switch) don't quietly fill up the device's storage over time.
 const MAX_BACKUPS_PER_WORLD = 5;
 
 function parseBackupFilename(f) {
-  // Format: <folder>__<ISO-with-colons-as-dashes>.tar.gz — colons are stripped because
-  // some Android/Termux storage backends don't allow them in filenames.
   const m = f.match(/^(.+)__(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.tar\.gz$/);
   if (!m) return null;
   return { folder: m[1], isoSafe: m[2], createdIso: m[2].replace(/T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, "T$1:$2:$3.$4Z") };
@@ -981,11 +708,6 @@ async function getBackups() {
   return backups;
 }
 
-// Backs up a single world folder to BACKUPS_DIR, pruning older backups of the same folder
-// beyond MAX_BACKUPS_PER_WORLD. Safe to call while the server is stopped or running (tar
-// reading a live world directory can occasionally miss an in-flight write, same tradeoff
-// Aternos'/Minehut's own "backup without stopping" options make — this isn't attempting
-// anything smarter like a filesystem snapshot, since Termux has no such primitive available).
 async function backupWorld(folder) {
   if (!(await ensureTar())) throw new Error("tar is not available and could not be installed");
   const worldPath = path.join(PAPER_DIR, folder);
@@ -998,7 +720,6 @@ async function backupWorld(folder) {
   await runCmd("tar", ["-czf", path.join(BACKUPS_DIR, filename), "-C", PAPER_DIR, folder]);
   log(`[Bridge] Backup saved: ${filename}`);
 
-  // Prune older backups of this same folder beyond the cap.
   const all = (await getBackups()).filter(b => b.folder === folder);
   for (const old of all.slice(MAX_BACKUPS_PER_WORLD)) {
     await fs.rm(path.join(BACKUPS_DIR, old.id), { force: true }).catch(() => {});
@@ -1007,10 +728,6 @@ async function backupWorld(folder) {
   return { id: filename, folder, createdIso: new Date().toISOString() };
 }
 
-// Backs up every world folder currently on disk. Called automatically before a Paper
-// version switch or a Java/Bedrock mode switch (both of which stop the server and touch
-// the install) — wrapped in try/catch by callers so a backup failure never blocks the
-// operation the user actually asked for, only gets logged.
 async function backupAllWorlds() {
   const worlds = await getWorlds();
   const results = [];
@@ -1035,8 +752,6 @@ async function restoreBackup(backupId) {
 
   const worldPath = path.join(PAPER_DIR, parsed.folder);
   log(`[Bridge] Restoring '${parsed.folder}' from ${backupId}...`);
-  // Replace the existing folder outright rather than merging, so a restore can't leave a mix
-  // of old and backed-up chunk files behind.
   await fs.rm(worldPath, { recursive: true, force: true });
   await runCmd("tar", ["-xzf", archivePath, "-C", PAPER_DIR]);
   log(`[Bridge] Restore complete: '${parsed.folder}'`);
@@ -1066,21 +781,9 @@ async function getPacks() {
   return packs;
 }
 
-// ─── Resource pack uploads ────────────────────────────────────────────────────────
-// BEFORE: the Packs tab only explained how to manually drop a .zip into
-// ~/pockethost/paper/resourcepacks/ via Termux — no in-app way to add one at all.
-// AFTER: the Packs tab can pick a .zip straight from the device's Downloads/Files via
-// expo-document-picker and send it here as base64 over the same WebSocket already used
-// for every other request — no separate HTTP upload server needed. Capped well under ws's
-// own default 100 MiB message limit (confirmed in the ws docs: maxPayload defaults to
-// 104857600 bytes) — base64 inflates raw size by ~4/3, so a 60 MB cap here stays safely
-// under that limit even with JSON framing overhead, and fails fast with a clear error
-// instead of silently stalling the WebSocket on an oversized pack.
 const MAX_PACK_UPLOAD_MB = 60;
 
 async function packInstallFromUpload(filename, dataBase64) {
-  // path.basename strips any directory components the picker's filename might carry,
-  // so this can never write outside RES_PACKS_DIR.
   const safeName = path.basename(String(filename || "").trim());
   if (!safeName || !safeName.toLowerCase().endsWith(".zip")) {
     throw new Error("Resource packs must be a .zip file");
@@ -1092,7 +795,6 @@ async function packInstallFromUpload(filename, dataBase64) {
   if (buf.length > MAX_PACK_UPLOAD_MB * 1024 * 1024) {
     throw new Error(`Pack is too large (max ${MAX_PACK_UPLOAD_MB} MB)`);
   }
-  // Same "is this really a zip" check pluginInstall() already uses for jars (PK magic bytes).
   if (buf[0] !== 0x50 || buf[1] !== 0x4b) {
     throw new Error("That file isn't a valid .zip resource pack");
   }
@@ -1106,8 +808,6 @@ async function packInstallFromUpload(filename, dataBase64) {
   broadcast("packs.update", { packs: state.packs });
   return { installed: safeName };
 }
-
-// ─── Plugin management ───────────────────────────────────────────────────────
 
 async function pluginList() {
   await fs.mkdir(PLUGINS_DIR, { recursive: true });
@@ -1148,20 +848,8 @@ async function pluginDelete(name) {
   return { deleted: filename };
 }
 
-// ─── Modrinth plugin/mod browser ──────────────────────────────────────────────
-// Both Aternos and Minehut let you search and one-tap install plugins/mods from a library
-// instead of needing a direct .jar URL (which was previously the only way to install one
-// here). Modrinth's public API is used — confirmed live and working against the real
-// endpoints below, not guessed: GET https://api.modrinth.com/v2/search (facets filter by
-// project_type), and GET https://api.modrinth.com/v2/project/{slug}/version (loaders filter,
-// each version's files[] has a `primary` flag and a direct `url`). Modrinth's docs require a
-// uniquely-identifying User-Agent on every request — wgetJson already sends PAPER_USER_AGENT
-// on every call, so no changes needed there.
 const MODRINTH_API = "https://api.modrinth.com/v2";
 
-// `projectType` is "plugin" or "mod" — both are real Modrinth search facets, confirmed live:
-// project_type:plugin returns real Bukkit/Paper/Spigot plugins (its displayed project_type
-// field is internally "mod" either way — a Modrinth quirk — but the facet itself works).
 async function pluginSearch(query, projectType) {
   const type = projectType === "mod" ? "mod" : "plugin";
   const facets = encodeURIComponent(JSON.stringify([[`project_type:${type}`]]));
@@ -1177,9 +865,6 @@ async function pluginSearch(query, projectType) {
   }));
 }
 
-// Resolves a Modrinth project slug to a concrete downloadable file compatible with this
-// server (Paper, which also serves Spigot/Bukkit plugins; Fabric for mods). Modrinth
-// returns versions newest-first, so the first one with a usable file wins.
 async function modrinthResolveDownload(slug, projectType) {
   const loaders = projectType === "mod" ? ["fabric"] : ["paper", "spigot", "bukkit"];
   const loadersParam = encodeURIComponent(JSON.stringify(loaders));
@@ -1199,12 +884,10 @@ async function pluginInstallFromModrinth(slug, projectType) {
   return pluginInstall(url, filename);
 }
 
-// ─── File management ────────────────────────────────────────────────────────
-
 function isSafePath(p) { return path.resolve(p).startsWith(path.resolve(ALLOWED_BASE)); }
 
 async function fileList(dir) {
-  const target = dir ? path.join(POCKETHOST_DIR, dir) : POCKETHOST_DIR;
+  const target = dir ? path.join(MINIHOST_DIR, dir) : MINIHOST_DIR;
   if (!isSafePath(target)) throw new Error("Access denied");
   const entries = await fs.readdir(target, { withFileTypes: true }).catch(() => []);
   return {
@@ -1248,20 +931,12 @@ async function shellExec(cmd) {
   });
 }
 
-// BEFORE: sent "stop\n" then waited a hardcoded 4 seconds, then deleted paper.jar.
-//         Paper can take 10–30 s to save chunks and shut down gracefully.
-//         Deleting the jar while Paper was still writing caused data corruption.
-// AFTER: calls the full stopServer() which waits up to 30 s for a clean exit.
 async function switchPaperVersion(mcVersion) {
   log(`[Bridge] Switching to Paper ${mcVersion}...`);
   if (serverProcess) {
     log("[Bridge] Stopping server before version switch...");
-    await stopServer();   // full graceful stop: sends "stop", waits 30 s max
+    await stopServer();
   }
-  // A version switch doesn't touch world files directly, but it's exactly the kind of
-  // operation where a bad Paper build or a plugin incompatibility could still corrupt data
-  // on next start — so back up first, same as Aternos does before anything risky. Never
-  // blocks the switch itself; backupAllWorlds() already swallows per-world failures.
   await backupAllWorlds().catch(err => log(`[Bridge] Pre-switch backup failed (continuing): ${err.message}`));
   let result = await tryGetStablePaperBuild(mcVersion);
   if (!result) {
@@ -1272,15 +947,6 @@ async function switchPaperVersion(mcVersion) {
   await wget(result.url, PAPER_JAR_PATH, ["--header", `User-Agent: ${PAPER_USER_AGENT}`]);
   log(`[Bridge] Switched to Paper ${result.version} build ${result.build}`);
 
-  // BEFORE: switching Paper versions never touched Geyser/ViaVersion/ViaBackwards/Floodgate at
-  //         all — an upgrade or downgrade could leave Bedrock support stale or (after a fresh
-  //         install elsewhere) entirely missing even though java_bedrock mode was already on.
-  // AFTER: re-verifies all Bedrock-support jars after every version switch. Geyser itself
-  //        always emulates the newest Java client protocol (it isn't per-MC-version — confirmed
-  //        via GeyserMC/ViaVersion docs), so what actually needs re-syncing on a Java version
-  //        change is ViaVersion/ViaBackwards (the protocol bridge to the backend you just
-  //        switched to) and Floodgate if the user opted into it; ensureGeyser below is just a
-  //        safety net in case the jar was removed out from under the bridge.
   let bedrockResynced = false;
   if (state.settings.mode === "java_bedrock") {
     if (!(await exists(GEYSER_JAR_PATH))) {
@@ -1294,10 +960,6 @@ async function switchPaperVersion(mcVersion) {
     log("[Bridge] Bedrock support (Geyser/ViaVersion/ViaBackwards" + (state.settings.bedrockAuth === "floodgate" ? "/Floodgate" : "") + ") re-synced for the new version");
   }
 
-  // BEFORE: the frontend had no way to know the requested version wasn't what it got — the
-  //         fallback was only ever written to the log.
-  // AFTER: `requested` + `fellBack` let version.tsx show "switched to X instead of Y" instead
-  //        of silently claiming success for a version that was never actually installed.
   return {
     switched:      result.version,
     requested:     mcVersion,
@@ -1347,9 +1009,6 @@ function parseLogLine(line) {
   if (tps) { state.stats.tps = Math.round(Number(tps[1]) * 10) / 10; broadcast("stats.update", { stats: state.stats }); }
 }
 
-// BEFORE: CPU was random drift (Math.random() * 8 - 4), RAM was random drift.
-//         Users were seeing completely fabricated numbers.
-// AFTER: CPU reads /proc/stat for a real inter-sample delta; RAM reads /proc/meminfo.
 function startStatsLoop() {
   if (statsInterval) return;
   let lastCpuTotal = 0, lastCpuIdle = 0;
@@ -1361,13 +1020,12 @@ function startStatsLoop() {
     }
     state.stats.uptimeSeconds = Math.floor((Date.now() - state.startedAtMs) / 1000);
 
-    // Real CPU: /proc/stat — "cpu user nice system idle iowait irq softirq ..."
     try {
       const stat    = await fs.readFile("/proc/stat", "utf8");
       const cpuLine = stat.split("\n")[0];
       const nums    = cpuLine.trim().split(/\s+/).slice(1).map(Number);
       const total   = nums.reduce((a, b) => a + b, 0);
-      const idle    = (nums[3] || 0) + (nums[4] || 0);    // idle + iowait
+      const idle    = (nums[3] || 0) + (nums[4] || 0);
       const dtotal  = total - lastCpuTotal;
       const didle   = idle  - lastCpuIdle;
       if (dtotal > 0) state.stats.cpuPercent = Math.min(100, Math.max(0, Math.round((1 - didle / dtotal) * 100)));
@@ -1375,7 +1033,6 @@ function startStatsLoop() {
       lastCpuIdle  = idle;
     } catch {}
 
-    // Real RAM: /proc/meminfo
     try {
       const mem  = await fs.readFile("/proc/meminfo", "utf8");
       const val  = (key) => { const m = mem.match(new RegExp(key + ":\\s+(\\d+)")); return m ? parseInt(m[1], 10) : 0; };
@@ -1391,15 +1048,8 @@ function startStatsLoop() {
 
 function stopStatsLoop() { if (statsInterval) { clearInterval(statsInterval); statsInterval = null; } }
 
-// ─── Server lifecycle ─────────────────────────────────────────────────────────
-
 async function startServer() {
   if (serverProcess || state.serverStatus === "installing") return snapshot();
-  // BEFORE: no check existed — if mode was ever null (fresh install, missing mode file,
-  //         onboarding UI skipped), installPaper() silently fell into the java-only branch
-  //         with no explicit user choice ever made.
-  // AFTER: refuses to start and returns a clear error the UI can catch to show the
-  //        mode-choice screen, so Java-only vs Java+Bedrock is always an explicit choice.
   if (state.settings.mode !== "java" && state.settings.mode !== "java_bedrock") {
     throw new Error("MODE_NOT_SET");
   }
@@ -1413,13 +1063,6 @@ async function startServer() {
     state.stats.ramUsedMb  = 0;
     broadcast("server.status", { status: "starting" });
 
-    // BEFORE: Paper was spawned once with the bare "java" command. If that Java was too old
-    //         for the installed Paper build (real example hit: "Minecraft 26.1 and newer
-    //         requires running the server with Java 25 or above"), Paper printed the error
-    //         and exited — bridge.mjs treated this exactly like any other crash and gave up.
-    // AFTER: launchPaper() is a named function so it can retry itself exactly once: if the
-    //        specific Java-version-requirement error is detected, we install the required
-    //        JDK via Termux's real pkg package and relaunch with the correct JAVA_BIN.
     let javaRequirementLine = null;
     let hasRetriedForJava   = false;
 
@@ -1439,7 +1082,6 @@ async function startServer() {
           log(line);
           parseLogLine(line);
 
-          // Also detect playit output if a playit Bukkit plugin is installed
           if (/playit/i.test(line)) {
             if (/https:\/\/playit\.gg\/claim\//i.test(line) || /ply\.gg:\d+/i.test(line)) {
               parsePlayitLine(line);
@@ -1452,7 +1094,7 @@ async function startServer() {
             state.stats.tps        = 20;
             broadcast("server.status", { status: "running" });
             broadcast("stats.update",  { stats: state.stats });
-            startPlayit();   // start playit AFTER server confirms ready; runs independently
+            startPlayit();
           }
         });
       });
@@ -1460,8 +1102,6 @@ async function startServer() {
       serverProcess.stderr.on("data", chunk => {
         String(chunk).split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach(l => {
           log(`[err] ${l}`);
-          // Real error text confirmed from an actual Paper 26.1.2 run on Termux:
-          // "Minecraft 26.1 and newer requires running the server with Java 25 or above."
           const m = l.match(/requires running the server with java (\d+)/i);
           if (m) javaRequirementLine = parseInt(m[1], 10);
         });
@@ -1475,7 +1115,6 @@ async function startServer() {
       });
 
       serverProcess.on("close", code => {
-        // Caught a real Java-version mismatch and haven't tried fixing it yet this start.
         if (code !== 0 && javaRequirementLine && !hasRetriedForJava) {
           hasRetriedForJava = true;
           const needed = javaRequirementLine;
@@ -1568,10 +1207,6 @@ async function deletePack(packId) {
   return snapshot();
 }
 
-// Lets the user switch between Java-only and Java+Bedrock at any time, not just at first setup.
-// Mirrors switchPaperVersion()'s pattern: stop the server before touching plugin jars (Paper
-// only loads plugins at startup — there's no safe hot-swap), download or remove Geyser/Via
-// accordingly, and require a restart to activate.
 async function setServerMode(mode) {
   if (mode !== "java" && mode !== "java_bedrock") throw new Error(`Invalid mode: ${mode}`);
 
@@ -1589,12 +1224,8 @@ async function setServerMode(mode) {
     await stopServer();
   }
 
-  // Same reasoning as switchPaperVersion(): mode switches add/remove plugin jars that affect
-  // how the world loads next start, so back up first. Never blocks the switch.
   await backupAllWorlds().catch(err => log(`[Bridge] Pre-switch backup failed (continuing): ${err.message}`));
 
-  // Set immediately — before downloads — so a concurrent startServer() call (which checks
-  // this same field in installPaper()) never reads a stale value while jars are still downloading.
   state.settings.mode = mode;
   await saveServerMode(mode);
 
@@ -1621,11 +1252,6 @@ async function setServerMode(mode) {
   return snapshot();
 }
 
-// Lets the user opt a java_bedrock install into Floodgate (its own Bedrock-player identity)
-// instead of the default shared "offline" identity, or back out of it. Opt-in and reversible —
-// see state.settings.bedrockAuth and FLOODGATE_JAR_PATH comments for why this isn't the
-// default. Mirrors setServerMode()'s stop-before-touching-plugins pattern, since Paper only
-// loads plugin configs at startup.
 async function setBedrockAuth(authType) {
   if (authType !== "offline" && authType !== "floodgate") throw new Error(`Invalid Bedrock auth type: ${authType}`);
   if (state.settings.mode !== "java_bedrock") throw new Error("Bedrock support isn't enabled — turn on Java + Bedrock mode first");
@@ -1667,8 +1293,6 @@ async function applySettings(payload) {
   return snapshot();
 }
 
-// ─── Request handler ───────────────────────────────────────────────────────────
-
 async function handleRequest(action, payload = {}) {
   switch (action) {
     case "server.start":           return startServer();
@@ -1700,24 +1324,7 @@ async function handleRequest(action, payload = {}) {
     case "server.versions":        return getPaperVersionList();
     case "server.version.switch":  return switchPaperVersion(String(payload.tag || ""));
 
-    // ── Playit ──────────────────────────────────────────────────────
-
-    // BEFORE: downloaded a native ARM64 binary (proven broken — no /run in Termux).
-    // AFTER: ensures Debian + playitd are installed, then starts the daemon. Connection
-    //        state arrives via tunnel.status broadcasts; this returns immediately.
     case "playit.setup": {
-      // BEFORE: awaited the full ensurePlayitReady() + startPlayit() chain before responding.
-      //         First-time setup installs an entire Debian environment (confirmed 5-8 minutes
-      //         on real device testing), but the app's WebSocket requests share a flat
-      //         25-second timeout — first-time setup could never finish in that window, so the
-      //         app always showed "Error: timeout: playit.setup" even though the real install
-      //         kept working correctly in the background (confirmed: tapping again afterward
-      //         found Debian already installed and surfaced a real claim link).
-      // AFTER: kicks off the real work without awaiting it here, returns immediately. The
-      //        existing tunnel.status broadcasts (already used for the claim-link flow) keep
-      //        the UI updated as things actually progress. A guard prevents this from ever
-      //        running twice concurrently, which also fixes a separate real bug: two
-      //        overlapping installs were fighting over Termux's own dpkg lock.
       if (playitSetupInProgress) {
         return { ok: true, alreadyRunning: true };
       }
@@ -1743,18 +1350,6 @@ async function handleRequest(action, payload = {}) {
       return { ok: true, started: true };
     }
 
-    // BEFORE: called execFileSync(PLAYIT_CLI, ["claim", "exchange", code]) — compiled binary,
-    //         broken. Then replaced with startClaimSetup() running `playit setup` — ALSO
-    //         confirmed broken: the installed playit version (1.0.10) has no `setup`
-    //         subcommand at all ("error: unexpected argument 'setup' found").
-    // AFTER: the CLI no longer generates its own claim link (confirmed: running the bare
-    //        daemon with no secret hangs forever on "Waiting for frontend secret
-    //        provisioning over IPC", no URL ever appears, even after 60+s). The real
-    //        working replacement, confirmed directly from playit.gg's own website
-    //        (account/setup/wizard -> Docker step): a SECRET_KEY is generated server-side
-    //        up front and handed to the daemon directly via its confirmed real --secret
-    //        flag — no claim link involved at all. This handler saves the key the user
-    //        pasted in the app and (re)starts the daemon with it.
     case "playit.set_secret": {
       const secret = String(payload.secret || "").trim();
       if (!secret) throw new Error("No secret key provided");
@@ -1767,8 +1362,6 @@ async function handleRequest(action, payload = {}) {
       return { ok: true };
     }
 
-    // BEFORE: was missing entirely — "Save Addresses" button always threw "Unknown action".
-    // AFTER: saves java/bedrock addresses to tunnels.json and updates tunnel state.
     case "playit.save_tunnels": {
       const java    = String(payload.java    || "").trim();
       const bedrock = String(payload.bedrock || "").trim();
@@ -1790,13 +1383,6 @@ async function handleRequest(action, payload = {}) {
       return { ok: true };
     }
 
-    // BEFORE: recovering from a stale/rejected secret required manual Termux commands —
-    //         `rm secret.key`, `rm tunnels.json`, `proot-distro login debian -- rm -rf
-    //         /root/.config/playit_gg` — confirmed painful on a real device while debugging
-    //         the stale-playitd-config bug above (clearPlayitdConfig()).
-    // AFTER: one action the app can trigger from a "Reset Tunnel" button. Reuses the same
-    //        clearPlayitdConfig() fix so a freshly pasted secret can never be shadowed by a
-    //        leftover internal playitd config, and clears our own secret + address cache too.
     case "playit.reset": {
       if (playitProcess) await stopPlayit();
       await clearPlayitdConfig();
@@ -1808,10 +1394,6 @@ async function handleRequest(action, payload = {}) {
       return { ok: true };
     }
 
-    // BEFORE: checked for the native ARM64 binary and an invented marker file.
-    // AFTER: checks Debian installation via `proot-distro list`'s confirmed real output
-    //        format. hasConfig is inferred from real signals (currently connected, or we
-    //        have cached addresses from a past successful connection).
     case "playit.status": {
       let listOutput = "";
       try { listOutput = execSync("proot-distro list 2>&1", { encoding: "utf8" }); } catch (e) { listOutput = String(e.stdout || ""); }
@@ -1821,14 +1403,6 @@ async function handleRequest(action, payload = {}) {
       let   savedTunnels    = {};
       try { savedTunnels = JSON.parse(await fs.readFile(PLAYIT_TUNNELS_FILE, "utf8")); } catch {}
 
-      // BEFORE: cached addresses were only returned in this response's own `tunnels` field,
-      //         never written into state.tunnel — the field the dashboard card actually reads
-      //         (via the tunnel.status broadcast/context). Result: after a bridge restart,
-      //         before the Minecraft server had been started once (which is what normally
-      //         restores this cache into state.tunnel), the dashboard showed nothing even
-      //         though the real addresses were sitting in tunnels.json the whole time.
-      // AFTER: hydrate state.tunnel here too, and broadcast, so any client that asks for
-      //        status (which happens automatically on app connect) fixes it for everyone.
       let hydrated = false;
       if (!state.tunnel.javaAddress && savedTunnels.java)       { state.tunnel.javaAddress    = savedTunnels.java;    hydrated = true; }
       if (!state.tunnel.bedrockAddress && savedTunnels.bedrock) { state.tunnel.bedrockAddress = savedTunnels.bedrock; hydrated = true; }
@@ -1850,8 +1424,6 @@ async function handleRequest(action, payload = {}) {
   }
 }
 
-// ─── Bootstrap ─────────────────────────────────────────────────────────────
-
 async function bootstrap() {
   await ensureDirs();
   await loadServerMode();
@@ -1860,17 +1432,6 @@ async function bootstrap() {
   startStatsLoop();
   await setupPhAlias();
 
-  // BEFORE: cached tunnel addresses were only ever hydrated into state.tunnel reactively
-  //         (via playit.status calls or startPlayit()'s own restore-on-start). Real bug this
-  //         missed: BridgeClient's own onopen handler calls server.snapshot() the instant
-  //         it reconnects, independent of which screen is open — and right after a bridge
-  //         restart, state.tunnel is still empty at that exact moment, so the app's context
-  //         gets overwritten with empty addresses before anything else has a chance to
-  //         hydrate it. Whether that later gets corrected depends on a specific frontend
-  //         effect re-firing, which isn't guaranteed if the screen was already mounted.
-  // AFTER: hydrate directly into the initial in-memory state before the WebSocket server
-  //        even starts accepting connections, so server.snapshot() is correct from the very
-  //        first response, regardless of any frontend timing.
   try {
     const cached = JSON.parse(await fs.readFile(PLAYIT_TUNNELS_FILE, "utf8"));
     if (cached.java)    state.tunnel.javaAddress    = cached.java;
@@ -1878,17 +1439,9 @@ async function bootstrap() {
     if (cached.java || cached.bedrock) log("[Bridge] Restored cached tunnel addresses from previous session");
   } catch {}
 
-  // BEFORE: two duplicate, conflicting IIFE blocks trying to pre-warm a tunnel using
-  //         native-binary config paths that never existed.
-  // AFTER: removed. Bridge startup happens with no Minecraft server running yet (fresh
-  //        Node process), so there's nothing to tunnel to — starting playitd here would
-  //        serve no purpose. startPlayit() is correctly triggered from launchPaper() once
-  //        Paper actually reports ready, and from schedulePlayitRestart() if it crashes
-  //        while the server is running.
-
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 8765 });
   console.log("[Bridge] Mini Host listening on ws://127.0.0.1:8765");
-  console.log("[Bridge] Tip: type 'ph' next time to start bridge");
+  console.log("[Bridge] Tip: type 'mh' next time to start bridge");
 
   wss.on("connection", ws => {
     clients.add(ws);
