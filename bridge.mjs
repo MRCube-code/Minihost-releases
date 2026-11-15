@@ -407,6 +407,21 @@ async function switchProfile(id) {
     await activateProfile(id);
     await saveActiveProfileId(id);
     log(`[Bridge] Switched to server profile "${target.name}"`);
+    // BEFORE: only "profiles.update" was broadcast, so every connected client's UI kept
+    // showing the PREVIOUS profile's settings/worlds/packs/tunnel (in particular its old
+    // `mode`), even though the bridge itself had already moved to the new profile's data.
+    // That let the Dashboard's "Start" button skip the mode-picker (it thought mode was
+    // still set from the old profile) and call server.start straight into MODE_NOT_SET.
+    // AFTER: broadcast every state slice that's profile-specific, exactly like a fresh
+    // connection's snapshot does, so all clients (including the one that switched) pick
+    // up the new profile's real state immediately.
+    broadcast("settings.update", { settings: state.settings });
+    broadcast("worlds.update",   { worlds: state.worlds });
+    broadcast("packs.update",    { packs: state.packs });
+    broadcast("tunnel.status",   { tunnel: state.tunnel });
+    broadcast("players.update",  { players: state.players });
+    broadcast("stats.update",    { stats: state.stats });
+    broadcast("server.status",   { status: state.serverStatus });
   }
   broadcast("profiles.update", { profiles, activeProfileId });
   return snapshot();
