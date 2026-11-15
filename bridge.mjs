@@ -7,22 +7,52 @@ import { WebSocketServer } from "ws";
 // ─── Constants ──────────────────────────────────────────────────────────
 
 const HOME             = os.homedir();
-const MINIHOST_DIR     = path.join(HOME, "minihost");
-const PAPER_DIR        = path.join(MINIHOST_DIR, "paper");
-const PLUGINS_DIR      = path.join(PAPER_DIR, "plugins");
-const RES_PACKS_DIR    = path.join(PAPER_DIR, "resourcepacks");
-const SERVER_PROPERTIES_PATH = path.join(PAPER_DIR, "server.properties");
-const EULA_PATH        = path.join(PAPER_DIR, "eula.txt");
-const PAPER_JAR_PATH   = path.join(PAPER_DIR, "paper.jar");
-const GEYSER_JAR_PATH  = path.join(PLUGINS_DIR, "Geyser-Spigot.jar");
-const VIAVERSION_JAR_PATH   = path.join(PLUGINS_DIR, "ViaVersion.jar");
-const VIABACKWARDS_JAR_PATH = path.join(PLUGINS_DIR, "ViaBackwards.jar");
-const FLOODGATE_JAR_PATH = path.join(PLUGINS_DIR, "floodgate-spigot.jar");
+// Fixed, never re-pointed — profile metadata lives here regardless of which
+// server is active.
+const MINIHOST_ROOT       = path.join(HOME, "minihost");
+const SERVERS_DIR         = path.join(MINIHOST_ROOT, "servers");
+const PROFILES_FILE       = path.join(MINIHOST_ROOT, "profiles.json");
+const ACTIVE_PROFILE_FILE = path.join(MINIHOST_ROOT, "active-profile.json");
 
-const PLAYIT_DIR          = path.join(MINIHOST_DIR, "playit");
-const BACKUPS_DIR         = path.join(MINIHOST_DIR, "backups");
-const PLAYIT_TUNNELS_FILE = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
-const PLAYIT_SECRET_FILE  = path.join(PLAYIT_DIR, "secret.key");      // playit.gg agent secret, pasted by the user once
+// BEFORE: every path below was a single hardcoded `const`, so the bridge could
+// only ever know about one Minecraft server.
+// AFTER: they're `let`s re-derived by applyProfileDir() for whichever profile
+// is active. "default" maps straight to MINIHOST_ROOT itself (no subfolder),
+// so existing single-server installs keep working with zero file-moving —
+// only profiles created after this update get their own
+// MINIHOST_ROOT/servers/<id> folder. See "Server Profiles" section below.
+let MINIHOST_DIR, PAPER_DIR, PLUGINS_DIR, RES_PACKS_DIR, SERVER_PROPERTIES_PATH,
+    EULA_PATH, PAPER_JAR_PATH, GEYSER_JAR_PATH, VIAVERSION_JAR_PATH,
+    VIABACKWARDS_JAR_PATH, FLOODGATE_JAR_PATH, PLAYIT_DIR, BACKUPS_DIR,
+    PLAYIT_TUNNELS_FILE, PLAYIT_SECRET_FILE, ALLOWED_BASE, MODE_FILE;
+
+function profileDirFor(id) {
+  return id === "default" ? MINIHOST_ROOT : path.join(SERVERS_DIR, id);
+}
+
+function applyProfileDir(dir) {
+  MINIHOST_DIR          = dir;
+  PAPER_DIR              = path.join(MINIHOST_DIR, "paper");
+  PLUGINS_DIR            = path.join(PAPER_DIR, "plugins");
+  RES_PACKS_DIR          = path.join(PAPER_DIR, "resourcepacks");
+  SERVER_PROPERTIES_PATH = path.join(PAPER_DIR, "server.properties");
+  EULA_PATH              = path.join(PAPER_DIR, "eula.txt");
+  PAPER_JAR_PATH         = path.join(PAPER_DIR, "paper.jar");
+  GEYSER_JAR_PATH        = path.join(PLUGINS_DIR, "Geyser-Spigot.jar");
+  VIAVERSION_JAR_PATH    = path.join(PLUGINS_DIR, "ViaVersion.jar");
+  VIABACKWARDS_JAR_PATH  = path.join(PLUGINS_DIR, "ViaBackwards.jar");
+  FLOODGATE_JAR_PATH     = path.join(PLUGINS_DIR, "floodgate-spigot.jar");
+  PLAYIT_DIR             = path.join(MINIHOST_DIR, "playit");
+  BACKUPS_DIR            = path.join(MINIHOST_DIR, "backups");
+  PLAYIT_TUNNELS_FILE    = path.join(PLAYIT_DIR, "tunnels.json");    // saved addresses (our own cache)
+  PLAYIT_SECRET_FILE     = path.join(PLAYIT_DIR, "secret.key");      // playit.gg agent secret, pasted by the user once
+  ALLOWED_BASE           = MINIHOST_DIR;
+  MODE_FILE              = path.join(MINIHOST_DIR, "server-mode.json");
+}
+// Safe default so nothing reads `undefined` paths before bootstrap() picks
+// the real active profile — bootstrap() re-applies the right one immediately.
+applyProfileDir(MINIHOST_ROOT);
+
 const DEBIAN_DISTRO       = "debian";
 
 const GEYSER_URL       = "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot";
@@ -30,8 +60,6 @@ const FLOODGATE_URL    = "https://download.geysermc.org/v2/projects/floodgate/ve
 const PAPER_API_BASE   = "https://fill.papermc.io/v3/projects/paper";
 const PAPER_USER_AGENT = "MiniHost/1.0 (+https://github.com/MRCube-code/Mini-Host)";
 const READY_PATTERNS   = [/Done \(/i, /\[Server thread\/INFO\].*Done/i];
-const ALLOWED_BASE     = MINIHOST_DIR;
-const MODE_FILE        = path.join(MINIHOST_DIR, "server-mode.json");
 
 async function installProotDebian() {
   log("[Bridge] Installing proot-distro...");
@@ -75,29 +103,34 @@ function getLocalIp() {
   return "check-wifi";
 }
 
+// Template used both for the initial state below and to reset settings/tunnel
+// when switching to a different server profile (see resetStateForProfile()).
+const DEFAULT_SETTINGS = {
+  gamemode: "survival", difficulty: "normal", maxPlayers: 20, ramMb: 2048,
+  port: 25565, bedrockPort: 19132, serverName: "Mini Host Server",
+  motd: "Powered by Mini Host", onlineMode: false, viewDistance: 8,
+  pvp: true, allowFlight: false, whiteList: false,
+  mode: null,
+  bedrockAuth: "offline",
+};
+const DEFAULT_TUNNEL = {
+  online:          false,
+  state:           "disconnected",
+  claimUrl:        "",
+  javaAddress:     "",
+  bedrockAddress:  "",
+  method:          "playit",
+};
+
 const state = {
   serverStatus: "stopped",
   logs: [],
   players: [],
   stats: { cpuPercent: 0, ramUsedMb: 0, ramLimitMb: 2048, tps: 20, uptimeSeconds: 0 },
-  settings: {
-    gamemode: "survival", difficulty: "normal", maxPlayers: 20, ramMb: 2048,
-    port: 25565, bedrockPort: 19132, serverName: "Mini Host Server",
-    motd: "Powered by Mini Host", onlineMode: false, viewDistance: 8,
-    pvp: true, allowFlight: false, whiteList: false,
-    mode: null,
-    bedrockAuth: "offline",
-  },
+  settings: { ...DEFAULT_SETTINGS },
   worlds: [],
   packs: [],
-  tunnel: {
-    online:          false,
-    state:           "disconnected",
-    claimUrl:        "",
-    javaAddress:     "",
-    bedrockAddress:  "",
-    method:          "playit",
-  },
+  tunnel: { ...DEFAULT_TUNNEL },
   startedAtMs: 0,
 };
 
@@ -129,6 +162,8 @@ function snapshot() {
     settings:        state.settings,
     tunnel:          state.tunnel,
     localIp:         getLocalIp(),
+    profiles:        profilesCache,
+    activeProfileId,
   };
 }
 
@@ -241,6 +276,140 @@ async function loadServerMode() {
 async function saveServerMode(mode) {
   await fs.mkdir(MINIHOST_DIR, { recursive: true });
   await fs.writeFile(MODE_FILE, JSON.stringify({ mode, bedrockAuth: state.settings.bedrockAuth || "offline" }));
+}
+
+// ─── Server Profiles ────────────────────────────────────────────────────
+// Lets one phone hold several named servers (e.g. "arm-mc", "anvil-mc") that
+// are switched between rather than run at once — only one Minecraft process
+// ever runs on this phone, so switching is blocked while it's running (see
+// switchProfile()). "default" is always the pre-existing ~/minihost layout;
+// every other profile gets its own ~/minihost/servers/<id> folder.
+
+let activeProfileId = "default";
+let profilesCache   = [];
+
+function slugifyProfileName(name) {
+  const base = String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return base || "server";
+}
+
+async function loadProfiles() {
+  try {
+    const data = JSON.parse(await fs.readFile(PROFILES_FILE, "utf8"));
+    if (Array.isArray(data) && data.length) { profilesCache = data; return data; }
+  } catch {}
+  const seeded = [{ id: "default", name: "My Server", createdIso: new Date().toISOString() }];
+  await saveProfiles(seeded);
+  return seeded;
+}
+
+async function saveProfiles(list) {
+  await fs.mkdir(MINIHOST_ROOT, { recursive: true });
+  await fs.writeFile(PROFILES_FILE, JSON.stringify(list, null, 2));
+  profilesCache = list;
+}
+
+async function loadActiveProfileId(profiles) {
+  try {
+    const data = JSON.parse(await fs.readFile(ACTIVE_PROFILE_FILE, "utf8"));
+    if (data.activeId && profiles.some(p => p.id === data.activeId)) return data.activeId;
+  } catch {}
+  return profiles[0]?.id || "default";
+}
+
+async function saveActiveProfileId(id) {
+  await fs.mkdir(MINIHOST_ROOT, { recursive: true });
+  await fs.writeFile(ACTIVE_PROFILE_FILE, JSON.stringify({ activeId: id }));
+}
+
+// Resets everything that's specific to "which server" before loading the
+// newly-active profile's own mode/settings — mirrors exactly what a fresh
+// bridge process already did for the single implicit server before profiles
+// existed (state.settings was never persisted beyond mode/bedrockAuth, so
+// this introduces no new behavior for the "default" profile).
+async function resetStateForProfile() {
+  state.settings = { ...DEFAULT_SETTINGS };
+  state.worlds   = [];
+  state.packs    = [];
+  state.players  = [];
+  state.stats    = { cpuPercent: 0, ramUsedMb: 0, ramLimitMb: state.settings.ramMb, tps: 20, uptimeSeconds: 0 };
+  state.tunnel   = { ...DEFAULT_TUNNEL };
+  await loadServerMode();
+}
+
+async function activateProfile(id) {
+  activeProfileId = id;
+  applyProfileDir(profileDirFor(id));
+  await ensureDirs();
+  await resetStateForProfile();
+  await getWorlds();
+  await getPacks();
+  try {
+    const cached = JSON.parse(await fs.readFile(PLAYIT_TUNNELS_FILE, "utf8"));
+    if (cached.java)    state.tunnel.javaAddress    = cached.java;
+    if (cached.bedrock) state.tunnel.bedrockAddress = cached.bedrock;
+  } catch {}
+}
+
+async function listProfiles() {
+  return { profiles: await loadProfiles(), activeProfileId };
+}
+
+async function createProfile(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) throw new Error("Name a server first.");
+  const profiles = await loadProfiles();
+  let id = slugifyProfileName(trimmed);
+  if (profiles.some(p => p.id === id)) id = `${id}-${Date.now().toString(36)}`;
+  profiles.push({ id, name: trimmed, createdIso: new Date().toISOString() });
+  await saveProfiles(profiles);
+  await fs.mkdir(profileDirFor(id), { recursive: true });
+  log(`[Bridge] Created server profile "${trimmed}"`);
+  broadcast("profiles.update", { profiles, activeProfileId });
+  return { id, profiles, activeProfileId };
+}
+
+async function renameProfile(id, name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) throw new Error("Name can't be empty.");
+  const profiles = await loadProfiles();
+  const p = profiles.find(p => p.id === id);
+  if (!p) throw new Error("Server not found.");
+  p.name = trimmed;
+  await saveProfiles(profiles);
+  broadcast("profiles.update", { profiles, activeProfileId });
+  return { profiles, activeProfileId };
+}
+
+async function deleteProfile(id) {
+  const profiles = await loadProfiles();
+  if (profiles.length <= 1) throw new Error("Can't delete your only server.");
+  if (id === activeProfileId) throw new Error("Switch to a different server before deleting this one.");
+  const idx = profiles.findIndex(p => p.id === id);
+  if (idx === -1) throw new Error("Server not found.");
+  const [removed] = profiles.splice(idx, 1);
+  await saveProfiles(profiles);
+  await fs.rm(profileDirFor(id), { recursive: true, force: true });
+  log(`[Bridge] Deleted server profile "${removed.name}"`);
+  broadcast("profiles.update", { profiles, activeProfileId });
+  return { profiles, activeProfileId };
+}
+
+async function switchProfile(id) {
+  if (serverProcess || state.serverStatus !== "stopped") {
+    throw new Error("Stop the server before switching to a different one.");
+  }
+  const profiles = await loadProfiles();
+  const target = profiles.find(p => p.id === id);
+  if (!target) throw new Error("Server not found.");
+  if (id !== activeProfileId) {
+    await stopPlayit().catch(() => {});
+    await activateProfile(id);
+    await saveActiveProfileId(id);
+    log(`[Bridge] Switched to server profile "${target.name}"`);
+  }
+  broadcast("profiles.update", { profiles, activeProfileId });
+  return snapshot();
 }
 
 async function setupPhAlias() {
@@ -1323,6 +1492,11 @@ async function handleRequest(action, payload = {}) {
     case "shell.exec":             return shellExec(String(payload.cmd || ""));
     case "server.versions":        return getPaperVersionList();
     case "server.version.switch":  return switchPaperVersion(String(payload.tag || ""));
+    case "profile.list":           return listProfiles();
+    case "profile.create":         return createProfile(String(payload.name || ""));
+    case "profile.rename":         return renameProfile(String(payload.id || ""), String(payload.name || ""));
+    case "profile.delete":         return deleteProfile(String(payload.id || ""));
+    case "profile.switch":         return switchProfile(String(payload.id || ""));
 
     case "playit.setup": {
       if (playitSetupInProgress) {
@@ -1425,19 +1599,14 @@ async function handleRequest(action, payload = {}) {
 }
 
 async function bootstrap() {
-  await ensureDirs();
-  await loadServerMode();
-  await getWorlds();
-  await getPacks();
+  const profiles = await loadProfiles();
+  const id       = await loadActiveProfileId(profiles);
+  await activateProfile(id);
+  if (state.tunnel.javaAddress || state.tunnel.bedrockAddress) {
+    log("[Bridge] Restored cached tunnel addresses from previous session");
+  }
   startStatsLoop();
   await setupPhAlias();
-
-  try {
-    const cached = JSON.parse(await fs.readFile(PLAYIT_TUNNELS_FILE, "utf8"));
-    if (cached.java)    state.tunnel.javaAddress    = cached.java;
-    if (cached.bedrock) state.tunnel.bedrockAddress = cached.bedrock;
-    if (cached.java || cached.bedrock) log("[Bridge] Restored cached tunnel addresses from previous session");
-  } catch {}
 
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 8765 });
   console.log("[Bridge] Mini Host listening on ws://127.0.0.1:8765");
